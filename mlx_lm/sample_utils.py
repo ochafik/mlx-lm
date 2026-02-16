@@ -307,3 +307,170 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
         return logits
 
     return repetition_penalty_processor
+
+
+class GrammarLogitsProcessor:
+    """
+    Logits processor that applies grammar constraints during generation.
+
+    This processor integrates with mlx-lm's existing logits_processors mechanism
+    to apply grammar constraints from llguidance or other grammar engines.
+
+    Example::
+
+        from mlx_lm.grammar import LLGuidanceState
+        from mlx_lm.sample_utils import GrammarLogitsProcessor
+
+        # Create grammar state
+        grammar = LLGuidanceState.from_json_schema(tokenizer, schema)
+
+        # Create processor
+        processor = GrammarLogitsProcessor(grammar)
+
+        # Use in generation
+        response = generate(
+            model, tokenizer, prompt,
+            logits_processors=[processor]
+        )
+
+    Args:
+        grammar_state: Grammar state object implementing get_token_mask().
+        warn_on_empty_mask: If True, warn when no tokens are allowed.
+    """
+
+    def __init__(self, grammar_state, *, warn_on_empty_mask: bool = True):
+        self.grammar = grammar_state
+        self._warn_on_empty = warn_on_empty_mask
+        self._warned = False
+        self._token_callback = None
+
+    def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
+        """
+        Apply grammar constraint to logits.
+
+        Args:
+            tokens: Previously generated tokens (shape: (seq_len,) or (batch, seq_len)).
+            logits: Logits from the model (shape: (batch, vocab_size)).
+
+        Returns:
+            Constrained logits with -inf for disallowed tokens.
+        """
+        # Update grammar with last token if we have generated tokens
+        if tokens.size > 0:
+            # Get last token
+            last_token = int(tokens.reshape(-1)[-1].item())
+            self.grammar.update(last_token)
+
+        # Check if complete
+        if self.grammar.is_complete():
+            return logits
+
+        # Get token mask from grammar
+        mask = self.grammar.get_token_mask()
+
+        # Check if any tokens are allowed
+        if self._warn_on_empty and not self._warned:
+            if not mx.any(mask):
+                import warnings
+                warnings.warn(
+                    "Grammar constraint has no valid tokens at current position. "
+                    "This may indicate a grammar that cannot be satisfied."
+                )
+                self._warned = True
+                return logits
+
+        # Apply constraint: set disallowed tokens to -inf
+        constrained = mx.where(
+            mask,
+            logits,
+            mx.full(logits.shape, float("-inf"), dtype=logits.dtype),
+        )
+
+        return constrained
+
+    @property
+    def is_complete(self) -> bool:
+        """Check if grammar generation is complete."""
+        return self.grammar.is_complete()
+
+    @property
+    def partial_output(self) -> str:
+        """Get the partial output generated so far."""
+        return self.grammar.partial_output
+
+    def reset(self):
+        """Reset the grammar state for reuse."""
+        self.grammar.reset()
+        self._warned = False
+
+
+def make_grammar_logits_processor(
+    tokenizer,
+    *,
+    json_schema: Optional[Dict] = None,
+    regex: Optional[str] = None,
+    choices: Optional[List[str]] = None,
+    tools: Optional[List[Dict]] = None,
+    grammar: Optional[str] = None,
+):
+    """
+    Create a grammar logits processor from various constraint types.
+
+    This is a convenience function that creates the appropriate grammar
+    state and wraps it in a GrammarLogitsProcessor.
+
+    Args:
+        tokenizer: HuggingFace tokenizer.
+        json_schema: JSON schema dict to constrain output.
+        regex: Regular expression pattern to match.
+        choices: List of allowed string values.
+        tools: List of tool definitions for tool calling.
+        grammar: Raw Lark grammar string.
+
+    Returns:
+        GrammarLogitsProcessor configured with the constraint.
+
+    Raises:
+        ImportError: If llguidance is not installed.
+        ValueError: If no constraint type is specified.
+
+    Example::
+
+        # JSON schema constraint
+        processor = make_grammar_logits_processor(
+            tokenizer,
+            json_schema={"type": "object", "properties": {"name": {"type": "string"}}}
+        )
+
+        # Regex constraint
+        processor = make_grammar_logits_processor(
+            tokenizer,
+            regex=r"[a-z]+@[a-z]+\\.com"
+        )
+
+        # Choice constraint
+        processor = make_grammar_logits_processor(
+            tokenizer,
+            choices=["yes", "no", "maybe"]
+        )
+    """
+    # Import grammar module (handles llguidance lazy loading)
+    from mlx_lm.grammar import LLGuidanceState
+
+    # Create appropriate grammar state
+    if json_schema is not None:
+        grammar_state = LLGuidanceState.from_json_schema(tokenizer, json_schema)
+    elif regex is not None:
+        grammar_state = LLGuidanceState.from_regex(tokenizer, regex)
+    elif choices is not None:
+        grammar_state = LLGuidanceState.from_choices(tokenizer, choices)
+    elif tools is not None:
+        grammar_state = LLGuidanceState.from_tools(tokenizer, tools)
+    elif grammar is not None:
+        grammar_state = LLGuidanceState(tokenizer, grammar)
+    else:
+        raise ValueError(
+            "Must specify one of: json_schema, regex, choices, tools, or grammar"
+        )
+
+    return GrammarLogitsProcessor(grammar_state)
