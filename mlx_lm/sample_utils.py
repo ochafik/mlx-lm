@@ -338,12 +338,16 @@ class GrammarLogitsProcessor:
         warn_on_empty_mask: If True, warn when no tokens are allowed.
     """
 
-    def __init__(self, grammar_state, *, warn_on_empty_mask: bool = True):
+    def __init__(self, grammar_state, *, warn_on_empty_mask: bool = True, eos_token_ids=None):
         self.grammar = grammar_state
         self._warn_on_empty = warn_on_empty_mask
         self._warned = False
         self._token_callback = None
         self._prev_tokens_len = 0
+        if isinstance(eos_token_ids, int):
+            self._eos_token_ids = {eos_token_ids}
+        else:
+            self._eos_token_ids = set(eos_token_ids or [])
 
     def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
         """
@@ -372,8 +376,14 @@ class GrammarLogitsProcessor:
                 self.grammar.update(token_id)
             self._prev_tokens_len = current_len
 
-        # Check if complete
+        # Check if complete — force EOS so generation stops
         if self.grammar.is_complete():
+            if self._eos_token_ids:
+                neg_inf = mx.full(logits.shape, float("-inf"), dtype=logits.dtype)
+                eos_mask = mx.zeros(logits.shape, dtype=mx.bool_)
+                for eos_id in self._eos_token_ids:
+                    eos_mask = eos_mask | (mx.arange(logits.shape[-1]) == eos_id)
+                return mx.where(eos_mask, logits, neg_inf)
             return logits
 
         # Get token mask from grammar
@@ -485,4 +495,15 @@ def make_grammar_logits_processor(
             "Must specify one of: json_schema, regex, choices, tools, or grammar"
         )
 
-    return GrammarLogitsProcessor(grammar_state)
+    # Get EOS token IDs so the processor can force stop when grammar completes
+    eos_ids = getattr(tokenizer, "eos_token_ids", None)
+    if eos_ids is None:
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        if isinstance(eos_id, int):
+            eos_ids = {eos_id}
+        elif eos_id is not None:
+            eos_ids = set(eos_id)
+        else:
+            eos_ids = set()
+
+    return GrammarLogitsProcessor(grammar_state, eos_token_ids=eos_ids)
