@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import json
 
 import mlx.core as mx
 
@@ -84,6 +85,33 @@ def setup_arg_parser():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    # Grammar-constrained generation options
+    grammar_group = parser.add_mutually_exclusive_group()
+    grammar_group.add_argument(
+        "--json-schema",
+        type=str,
+        default=None,
+        help="JSON schema to constrain output (as JSON string or @file.json)",
+    )
+    grammar_group.add_argument(
+        "--grammar",
+        type=str,
+        default=None,
+        help="Lark grammar string to constrain output",
+    )
+    grammar_group.add_argument(
+        "--regex",
+        type=str,
+        default=None,
+        help="Regular expression to constrain output",
+    )
+    grammar_group.add_argument(
+        "--choices",
+        type=str,
+        nargs="+",
+        default=None,
+        help="List of allowed output strings",
+    )
     return parser
 
 
@@ -121,7 +149,27 @@ def main():
         rprint("- 'r' to reset the chat")
         rprint("- 'h' to display these commands")
 
+    # Build grammar logits processor if requested
+    grammar_processor = None
+    json_schema = args.json_schema
+    if json_schema is not None and json_schema.startswith("@"):
+        with open(json_schema[1:]) as f:
+            json_schema = f.read()
+    if json_schema is not None or args.grammar is not None or args.regex is not None or args.choices is not None:
+        from .sample_utils import make_grammar_logits_processor
+
+        json_schema_dict = json.loads(json_schema) if json_schema else None
+        grammar_processor = make_grammar_logits_processor(
+            tokenizer,
+            json_schema=json_schema_dict,
+            grammar=args.grammar,
+            regex=args.regex,
+            choices=args.choices,
+        )
+
     rprint(f"[INFO] Starting chat session with {args.model}.")
+    if grammar_processor is not None:
+        rprint("[INFO] Grammar constraints active.")
     print_help()
     prompt_cache = make_prompt_cache(model, args.max_kv_size)
     while True:
@@ -142,6 +190,10 @@ def main():
             messages,
             add_generation_prompt=True,
         )
+        logits_processors = None
+        if grammar_processor is not None:
+            grammar_processor.reset()
+            logits_processors = [grammar_processor]
         for response in stream_generate(
             model,
             tokenizer,
@@ -157,6 +209,7 @@ def main():
                 ),
             ),
             prompt_cache=prompt_cache,
+            logits_processors=logits_processors,
         ):
             rprint(response.text, flush=True, end="")
         rprint()

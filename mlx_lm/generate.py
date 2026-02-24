@@ -160,6 +160,33 @@ def setup_arg_parser():
         " string keys to values represented as a JSON decodable string.",
         default=None,
     )
+    # Grammar-constrained generation options
+    grammar_group = parser.add_mutually_exclusive_group()
+    grammar_group.add_argument(
+        "--json-schema",
+        type=str,
+        default=None,
+        help="JSON schema to constrain output (as JSON string or @file.json)",
+    )
+    grammar_group.add_argument(
+        "--grammar",
+        type=str,
+        default=None,
+        help="Lark grammar string to constrain output",
+    )
+    grammar_group.add_argument(
+        "--regex",
+        type=str,
+        default=None,
+        help="Regular expression to constrain output",
+    )
+    grammar_group.add_argument(
+        "--choices",
+        type=str,
+        nargs="+",
+        default=None,
+        help="List of allowed output strings",
+    )
     parser.add_argument(
         "--verbose",
         type=str2bool,
@@ -1451,6 +1478,26 @@ def main():
         xtc_threshold=args.xtc_threshold,
         xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
+
+    # Build grammar logits processor if requested
+    logits_processors = None
+    json_schema = args.json_schema
+    if json_schema is not None and json_schema.startswith("@"):
+        with open(json_schema[1:]) as f:
+            json_schema = f.read()
+    if json_schema is not None or args.grammar is not None or args.regex is not None or args.choices is not None:
+        from .sample_utils import make_grammar_logits_processor
+
+        json_schema_dict = json.loads(json_schema) if json_schema else None
+        processor = make_grammar_logits_processor(
+            tokenizer,
+            json_schema=json_schema_dict,
+            grammar=args.grammar,
+            regex=args.regex,
+            choices=args.choices,
+        )
+        logits_processors = [processor]
+
     response = generate(
         model,
         tokenizer,
@@ -1465,6 +1512,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        logits_processors=logits_processors,
     )
     if not args.verbose:
         print(response)

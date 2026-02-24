@@ -52,12 +52,57 @@ def is_llguidance_available() -> bool:
         return False
 
 
+def _make_ll_tokenizer(tokenizer):
+    """
+    Create an LLTokenizer from a HuggingFace tokenizer.
+
+    llguidance requires a TokenizerWrapper with specific attributes
+    (.tokens, .eos_token_id, .bos_token_id, .special_token_ids, __call__).
+    This bridge adapts a HuggingFace tokenizer to that interface.
+    """
+    llg = _get_llguidance()
+
+    # Keep the outer HF tokenizer for metadata (eos_token_id, vocab, etc.)
+    # It might be wrapped in an mlx-lm TokenizerWrapper that has ._tokenizer
+    # pointing to a fast tokenizers.Tokenizer - we want the PreTrainedTokenizer
+    hf_tok = tokenizer
+    # If it's an mlx-lm TokenizerWrapper, get the underlying PreTrainedTokenizer
+    if hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer, "encode"):
+        hf_tok = tokenizer
+
+    class _HFBridge:
+        def __init__(self, hf_tok):
+            self.eos_token_id = hf_tok.eos_token_id
+            self.bos_token_id = getattr(hf_tok, "bos_token_id", None)
+
+            # Build tokens list: bytes for each token id
+            vocab = hf_tok.get_vocab()
+            max_id = max(vocab.values()) if vocab else 0
+            self.tokens = [b""] * (max_id + 1)
+            for token_str, token_id in vocab.items():
+                self.tokens[token_id] = token_str.encode("utf-8", errors="replace")
+
+            self.special_token_ids = list(
+                getattr(hf_tok, "all_special_ids", [])
+            )
+            self._hf_tok = hf_tok
+
+        def __call__(self, text):
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", errors="replace")
+            return self._hf_tok.encode(text, add_special_tokens=False)
+
+    bridge = _HFBridge(hf_tok)
+    wrapper = llg.TokenizerWrapper(bridge)
+    return llg.LLTokenizer(wrapper), hf_tok
+
+
 class LLGuidanceState(GrammarState):
     """
     Grammar state implementation using LLGuidance.
 
     LLGuidance provides a Rust-based grammar engine with Lark grammar
-    support and efficient token mask computation (~1-10μs per token).
+    support and efficient token mask computation.
 
     Example::
 
@@ -69,9 +114,6 @@ class LLGuidanceState(GrammarState):
 
         # From regex
         grammar = LLGuidanceState.from_regex(tokenizer, r"[a-z]+@[a-z]+\\.com")
-
-        # From Lark grammar
-        grammar = LLGuidanceState(tokenizer, 'start: "hello" NAME')
     """
 
     def __init__(
@@ -82,32 +124,22 @@ class LLGuidanceState(GrammarState):
         vocab_size: Optional[int] = None,
     ):
         """
-        Initialize from a Lark grammar string.
+        Initialize from an llguidance grammar definition string.
 
         Args:
-            tokenizer: HuggingFace tokenizer (or TokenizerWrapper).
-            grammar: Lark grammar string.
+            tokenizer: HuggingFace tokenizer (or mlx-lm TokenizerWrapper).
+            grammar: llguidance grammar definition string (from grammar_from()).
             vocab_size: Optional vocabulary size override.
         """
         llg = _get_llguidance()
 
-        # Handle TokenizerWrapper
-        self._hf_tokenizer = getattr(tokenizer, "_tokenizer", tokenizer)
-
-        # Create llguidance tokenizer
-        self._ll_tokenizer = llg.LLTokenizer.from_hf_tokenizer(self._hf_tokenizer)
-
-        # Create matcher
+        self._ll_tokenizer, self._hf_tokenizer = _make_ll_tokenizer(tokenizer)
         self._matcher = llg.LLMatcher(self._ll_tokenizer, grammar)
 
-        # Store vocab size
         if vocab_size is not None:
             self._vocab_size = vocab_size
-        elif hasattr(self._hf_tokenizer, "vocab_size"):
-            self._vocab_size = self._hf_tokenizer.vocab_size
         else:
-            # Fallback: get from vocab
-            self._vocab_size = len(self._hf_tokenizer.get_vocab())
+            self._vocab_size = self._ll_tokenizer.vocab_size
 
         self._completed = False
         self._grammar_str = grammar
@@ -126,22 +158,6 @@ class LLGuidanceState(GrammarState):
         Args:
             tokenizer: HuggingFace tokenizer.
             schema: JSON schema as dict or JSON string.
-            **kwargs: Additional arguments to constructor.
-
-        Returns:
-            LLGuidanceState configured for the schema.
-
-        Example::
-
-            schema = {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "age": {"type": "integer", "minimum": 0}
-                },
-                "required": ["name"]
-            }
-            grammar = LLGuidanceState.from_json_schema(tokenizer, schema)
         """
         llg = _get_llguidance()
 
@@ -164,18 +180,6 @@ class LLGuidanceState(GrammarState):
         Args:
             tokenizer: HuggingFace tokenizer.
             pattern: Regular expression pattern.
-            **kwargs: Additional arguments to constructor.
-
-        Returns:
-            LLGuidanceState configured for the pattern.
-
-        Example::
-
-            # Email pattern
-            grammar = LLGuidanceState.from_regex(
-                tokenizer,
-                r"[a-z]+@[a-z]+\\.[a-z]+"
-            )
         """
         llg = _get_llguidance()
         grammar = llg.grammar_from("regex", pattern)
@@ -194,17 +198,6 @@ class LLGuidanceState(GrammarState):
         Args:
             tokenizer: HuggingFace tokenizer.
             choices: List of allowed string values.
-            **kwargs: Additional arguments to constructor.
-
-        Returns:
-            LLGuidanceState that only allows the given choices.
-
-        Example::
-
-            grammar = LLGuidanceState.from_choices(
-                tokenizer,
-                ["yes", "no", "maybe"]
-            )
         """
         llg = _get_llguidance()
         grammar = llg.grammar_from("choice", json.dumps(choices))
@@ -220,30 +213,9 @@ class LLGuidanceState(GrammarState):
         """
         Create grammar state for tool calling.
 
-        Automatically detects the tool call format from the tokenizer's
-        chat template and generates an appropriate grammar.
-
         Args:
             tokenizer: HuggingFace tokenizer with chat_template.
             tools: List of tool definitions.
-            **kwargs: Additional arguments to constructor.
-
-        Returns:
-            LLGuidanceState configured for tool calling.
-
-        Example::
-
-            tools = [
-                {
-                    "name": "get_weather",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                        "required": ["city"]
-                    }
-                }
-            ]
-            grammar = LLGuidanceState.from_tools(tokenizer, tools)
         """
         from .tool_schema import build_tool_grammar
 
@@ -258,15 +230,13 @@ class LLGuidanceState(GrammarState):
             mx.array of shape (vocab_size,) with True for allowed tokens.
         """
         if self._completed:
-            # If complete, disallow all tokens (generation should stop)
             return mx.zeros((self._vocab_size,), dtype=mx.bool_)
 
-        # Get mask from llguidance
-        mask_np = self._matcher.get_token_mask()
-
-        # Convert to MLX boolean array
-        # llguidance returns numpy bool array
-        return mx.array(mask_np.astype(np.bool_))
+        # compute_bitmask() returns bytes (packed bits, little-endian)
+        mask_bytes = self._matcher.compute_bitmask()
+        mask_np = np.frombuffer(mask_bytes, dtype=np.uint8)
+        bool_mask = np.unpackbits(mask_np, bitorder="little")[: self._vocab_size]
+        return mx.array(bool_mask.astype(np.bool_))
 
     def update(self, token_id: int) -> None:
         """
@@ -279,60 +249,47 @@ class LLGuidanceState(GrammarState):
             return
 
         self._generated_tokens.append(token_id)
-        self._matcher.commit_token(token_id)
-        self._completed = self._matcher.is_terminated()
+        self._matcher.consume_token(token_id)
+        self._completed = self._matcher.is_stopped()
 
     def is_complete(self) -> bool:
-        """
-        Check if the grammar has been fully satisfied.
-
-        Returns:
-            True if grammar is complete and generation should stop.
-        """
+        """Check if the grammar has been fully satisfied."""
         return self._completed
 
     @property
     def partial_output(self) -> str:
-        """
-        Get the partial UTF-8 output generated so far.
-
-        Returns:
-            The text generated so far.
-        """
-        try:
-            return self._matcher.get_partial_utf8()
-        except Exception:
-            # Fallback to decoding tokens
-            return self._hf_tokenizer.decode(
-                self._generated_tokens, skip_special_tokens=False
-            )
+        """Get the partial output generated so far."""
+        return self._hf_tokenizer.decode(
+            self._generated_tokens, skip_special_tokens=False
+        )
 
     def reset(self) -> None:
-        """
-        Reset the grammar state to its initial position.
-        """
+        """Reset the grammar state to its initial position."""
         llg = _get_llguidance()
         self._matcher = llg.LLMatcher(self._ll_tokenizer, self._grammar_str)
         self._completed = False
         self._generated_tokens = []
 
     def clone(self) -> "LLGuidanceState":
-        """
-        Create a copy of this grammar state.
+        """Create a copy of this grammar state."""
+        new_state = LLGuidanceState.__new__(LLGuidanceState)
+        new_state._ll_tokenizer = self._ll_tokenizer
+        new_state._hf_tokenizer = self._hf_tokenizer
+        new_state._vocab_size = self._vocab_size
+        new_state._grammar_str = self._grammar_str
+        new_state._generated_tokens = self._generated_tokens.copy()
+        new_state._completed = self._completed
 
-        Returns:
-            A new LLGuidanceState at the same position.
-        """
-        # Create new instance with same grammar
-        new_state = LLGuidanceState(
-            self._hf_tokenizer,
-            self._grammar_str,
-            vocab_size=self._vocab_size,
-        )
-
-        # Replay tokens to reach same state
-        for token in self._generated_tokens:
-            new_state.update(token)
+        # Use deep_copy if available, otherwise replay tokens
+        if hasattr(self._matcher, "deep_copy"):
+            new_state._matcher = self._matcher.deep_copy()
+        else:
+            llg = _get_llguidance()
+            new_state._matcher = llg.LLMatcher(
+                self._ll_tokenizer, self._grammar_str
+            )
+            for token in self._generated_tokens:
+                new_state._matcher.consume_token(token)
 
         return new_state
 

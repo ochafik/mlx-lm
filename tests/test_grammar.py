@@ -265,7 +265,11 @@ class TestGrammarLogitsProcessor:
         assert result.shape == logits.shape
 
     def test_processor_completion(self):
-        """Test processor tracks completion."""
+        """Test processor tracks completion.
+
+        Simulates the real generate_step pattern where tokens accumulate:
+        first call has prompt tokens, subsequent calls append generated tokens.
+        """
         from mlx_lm.sample_utils import GrammarLogitsProcessor
         from mlx_lm.grammar.llguidance_adapter import MockGrammarState
 
@@ -273,12 +277,15 @@ class TestGrammarLogitsProcessor:
         grammar._max_tokens = 5
         processor = GrammarLogitsProcessor(grammar)
 
-        tokens = mx.array([1])
         logits = mx.random.normal((1, 100))
+        # First call: prompt tokens (not fed to grammar)
+        accumulated = mx.array([99])
+        processor(accumulated, logits)
 
-        # Process tokens until complete
+        # Subsequent calls: append generated tokens (fed to grammar)
         for i in range(10):
-            processor(mx.array([i]), logits)
+            accumulated = mx.concat([accumulated, mx.array([i])])
+            processor(accumulated, logits)
             if processor.is_complete:
                 break
 
@@ -293,9 +300,15 @@ class TestGrammarLogitsProcessor:
         grammar._max_tokens = 5
         processor = GrammarLogitsProcessor(grammar)
 
-        # Process some tokens
+        logits = mx.random.normal((1, 100))
+        # First call: prompt tokens
+        accumulated = mx.array([99])
+        processor(accumulated, logits)
+
+        # Generate tokens until complete
         for i in range(10):
-            processor(mx.array([i]), mx.random.normal((1, 100)))
+            accumulated = mx.concat([accumulated, mx.array([i])])
+            processor(accumulated, logits)
 
         assert processor.is_complete
 
@@ -420,6 +433,295 @@ class TestTokenizerIntegration:
 
         assert grammar is not None
         assert "test_tool" in grammar
+
+
+class TestLLGuidanceRealIntegration:
+    """Integration tests that require llguidance to be installed."""
+
+    @pytest.fixture
+    def hf_tokenizer(self):
+        """Load a real HF tokenizer for integration tests."""
+        pytest.importorskip("llguidance")
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(
+            "mlx-community/Llama-3.2-1B-Instruct-4bit"
+        )
+
+    def test_from_json_schema(self, hf_tokenizer):
+        """Test LLGuidanceState.from_json_schema with real tokenizer."""
+        from mlx_lm.grammar import LLGuidanceState
+
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }
+        state = LLGuidanceState.from_json_schema(hf_tokenizer, schema)
+        assert not state.is_complete()
+
+        mask = state.get_token_mask()
+        assert mask.shape[0] > 0
+        assert mask.sum().item() > 0  # Some tokens allowed
+
+    def test_from_regex(self, hf_tokenizer):
+        """Test LLGuidanceState.from_regex with real tokenizer."""
+        from mlx_lm.grammar import LLGuidanceState
+
+        state = LLGuidanceState.from_regex(hf_tokenizer, "[a-z]+")
+        mask = state.get_token_mask()
+        assert mask.sum().item() > 0
+
+    def test_from_choices(self, hf_tokenizer):
+        """Test LLGuidanceState.from_choices with real tokenizer."""
+        from mlx_lm.grammar import LLGuidanceState
+
+        state = LLGuidanceState.from_choices(hf_tokenizer, ["yes", "no"])
+        mask = state.get_token_mask()
+        assert mask.sum().item() > 0
+
+    def test_token_feeding(self, hf_tokenizer):
+        """Test feeding tokens through the grammar state."""
+        from mlx_lm.grammar import LLGuidanceState
+
+        schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        state = LLGuidanceState.from_json_schema(hf_tokenizer, schema)
+
+        # Feed '{'
+        open_brace = hf_tokenizer.encode("{", add_special_tokens=False)[0]
+        state.update(open_brace)
+        assert not state.is_complete()
+        assert state.partial_output == "{"
+
+    def test_clone(self, hf_tokenizer):
+        """Test cloning a grammar state."""
+        from mlx_lm.grammar import LLGuidanceState
+
+        state = LLGuidanceState.from_regex(hf_tokenizer, "[a-z]+")
+        # Feed a letter
+        a_id = hf_tokenizer.encode("a", add_special_tokens=False)[0]
+        state.update(a_id)
+
+        cloned = state.clone()
+        assert len(cloned.generated_tokens) == len(state.generated_tokens)
+
+    def test_reset(self, hf_tokenizer):
+        """Test resetting a grammar state."""
+        from mlx_lm.grammar import LLGuidanceState
+
+        state = LLGuidanceState.from_regex(hf_tokenizer, "[a-z]+")
+        a_id = hf_tokenizer.encode("a", add_special_tokens=False)[0]
+        state.update(a_id)
+        assert len(state.generated_tokens) == 1
+
+        state.reset()
+        assert len(state.generated_tokens) == 0
+        assert not state.is_complete()
+
+    def test_grammar_logits_processor_with_real_grammar(self, hf_tokenizer):
+        """Test GrammarLogitsProcessor with a real llguidance grammar."""
+        from mlx_lm.grammar import LLGuidanceState
+        from mlx_lm.sample_utils import GrammarLogitsProcessor
+
+        state = LLGuidanceState.from_json_schema(
+            hf_tokenizer,
+            {"type": "object", "properties": {"a": {"type": "string"}}},
+        )
+        processor = GrammarLogitsProcessor(state)
+
+        vocab_size = state._vocab_size
+        logits = mx.zeros((1, vocab_size))
+        tokens = mx.array([], dtype=mx.int32)
+
+        result = processor(tokens, logits)
+        assert result.shape == logits.shape
+        # Some tokens should be -inf (constrained)
+        assert mx.any(result == float("-inf")).item()
+
+    def test_make_grammar_logits_processor(self, hf_tokenizer):
+        """Test the make_grammar_logits_processor factory."""
+        from mlx_lm.sample_utils import make_grammar_logits_processor
+
+        proc = make_grammar_logits_processor(
+            hf_tokenizer,
+            json_schema={"type": "object"},
+        )
+        assert proc is not None
+        assert not proc.is_complete
+
+
+class TestCLIGrammarArgs:
+    """Test grammar CLI argument parsing."""
+
+    def test_generate_arg_parser_has_grammar_args(self):
+        """Test that generate.py arg parser has grammar arguments."""
+        from mlx_lm.generate import setup_arg_parser
+
+        parser = setup_arg_parser()
+        args = parser.parse_args(
+            ["--json-schema", '{"type": "object"}', "--prompt", "test"]
+        )
+        assert args.json_schema == '{"type": "object"}'
+        assert args.grammar is None
+        assert args.regex is None
+        assert args.choices is None
+
+    def test_generate_regex_arg(self):
+        from mlx_lm.generate import setup_arg_parser
+
+        parser = setup_arg_parser()
+        args = parser.parse_args(["--regex", "[a-z]+", "--prompt", "test"])
+        assert args.regex == "[a-z]+"
+        assert args.json_schema is None
+
+    def test_generate_choices_arg(self):
+        from mlx_lm.generate import setup_arg_parser
+
+        parser = setup_arg_parser()
+        args = parser.parse_args(["--choices", "yes", "no", "--prompt", "test"])
+        assert args.choices == ["yes", "no"]
+
+    def test_generate_mutually_exclusive(self):
+        """Test that grammar args are mutually exclusive."""
+        from mlx_lm.generate import setup_arg_parser
+
+        parser = setup_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                ["--json-schema", '{}', "--regex", "abc", "--prompt", "test"]
+            )
+
+
+class TestServerGrammarArgs:
+    """Test server-side grammar argument handling."""
+
+    def test_parse_json_schema_response_format(self):
+        """Test parsing OpenAI-style response_format with json_schema."""
+        from mlx_lm.server import GrammarArguments
+
+        # Simulate what _parse_grammar_args does
+        rf = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "person",
+                "schema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                },
+            },
+        }
+        # Extract the schema (nested under "schema" key per OpenAI spec)
+        schema = rf.get("json_schema", {})
+        if "schema" in schema:
+            schema = schema["schema"]
+
+        args = GrammarArguments(json_schema=schema)
+        assert args.json_schema == {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+        }
+
+    def test_parse_json_object_response_format(self):
+        """Test parsing response_format with type=json_object."""
+        from mlx_lm.server import GrammarArguments
+
+        args = GrammarArguments(json_schema={"type": "object"})
+        assert args.json_schema == {"type": "object"}
+
+    def test_grammar_arguments_default_none(self):
+        """Test GrammarArguments defaults."""
+        from mlx_lm.server import GrammarArguments
+
+        args = GrammarArguments()
+        assert args.json_schema is None
+        assert args.regex is None
+        assert args.choices is None
+
+
+class TestEndToEndGeneration:
+    """End-to-end tests with real model generation.
+
+    These tests download and run a small model. They're slower but validate
+    the full pipeline from prompt to constrained output.
+    """
+
+    @pytest.fixture(scope="class")
+    def model_and_tokenizer(self):
+        pytest.importorskip("llguidance")
+        from mlx_lm import load
+
+        return load("mlx-community/Llama-3.2-1B-Instruct-4bit")
+
+    def test_json_schema_generation(self, model_and_tokenizer):
+        """Test that JSON schema constraint produces valid JSON."""
+        from mlx_lm import generate
+        from mlx_lm.sample_utils import make_grammar_logits_processor, make_sampler
+
+        model, tokenizer = model_and_tokenizer
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name", "age"],
+            "additionalProperties": False,
+        }
+        processor = make_grammar_logits_processor(tokenizer, json_schema=schema)
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Return JSON for a person named Alice age 25"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+        response = generate(
+            model, tokenizer, prompt_tokens,
+            max_tokens=100, sampler=make_sampler(0.0),
+            logits_processors=[processor], verbose=False,
+        )
+        parsed = json.loads(response)
+        assert isinstance(parsed, dict)
+        assert "name" in parsed
+        assert "age" in parsed
+
+    def test_regex_generation(self, model_and_tokenizer):
+        """Test that regex constraint limits output."""
+        from mlx_lm import generate
+        from mlx_lm.sample_utils import make_grammar_logits_processor, make_sampler
+
+        model, tokenizer = model_and_tokenizer
+        processor = make_grammar_logits_processor(tokenizer, regex="(yes|no)")
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Is water wet? yes or no"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+        response = generate(
+            model, tokenizer, prompt_tokens,
+            max_tokens=10, sampler=make_sampler(0.0),
+            logits_processors=[processor], verbose=False,
+        )
+        assert response.strip() in ("yes", "no")
+
+    def test_choices_generation(self, model_and_tokenizer):
+        """Test that choices constraint limits output."""
+        from mlx_lm import generate
+        from mlx_lm.sample_utils import make_grammar_logits_processor, make_sampler
+
+        model, tokenizer = model_and_tokenizer
+        processor = make_grammar_logits_processor(
+            tokenizer, choices=["red", "blue", "green"]
+        )
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Pick a color"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+        response = generate(
+            model, tokenizer, prompt_tokens,
+            max_tokens=10, sampler=make_sampler(0.0),
+            logits_processors=[processor], verbose=False,
+        )
+        assert response.strip() in ("red", "blue", "green")
 
 
 if __name__ == "__main__":

@@ -332,6 +332,13 @@ class LogitsProcessorArguments:
 
 
 @dataclass
+class GrammarArguments:
+    json_schema: Optional[Dict[str, Any]] = None
+    regex: Optional[str] = None
+    choices: Optional[List[str]] = None
+
+
+@dataclass
 class GenerationArguments:
     model: ModelDescription
     sampling: SamplingArguments
@@ -345,6 +352,7 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    grammar: Optional[GrammarArguments] = None
 
 
 @dataclass
@@ -551,12 +559,25 @@ def _make_sampler(args, tokenizer):
     )
 
 
-def _make_logits_processors(args):
-    return make_logits_processors(
+def _make_logits_processors(args, tokenizer=None):
+    processors = make_logits_processors(
         args.logits.logit_bias,
         args.logits.repetition_penalty,
         args.logits.repetition_context_size,
     )
+    if args.grammar is not None and tokenizer is not None:
+        g = args.grammar
+        if g.json_schema or g.regex or g.choices:
+            from .sample_utils import make_grammar_logits_processor
+
+            grammar_proc = make_grammar_logits_processor(
+                tokenizer,
+                json_schema=g.json_schema,
+                regex=g.regex,
+                choices=g.choices,
+            )
+            processors = (processors or []) + [grammar_proc]
+    return processors
 
 
 def _format_top_logprobs(logprobs, top_logprobs, tokenizer) -> Tuple[Dict[str, Any]]:
@@ -761,7 +782,7 @@ class ResponseGenerator:
                         args.max_tokens,
                         caches=[cache],
                         samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
+                        logits_processors=[_make_logits_processors(args, tokenizer)],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -911,7 +932,7 @@ class ResponseGenerator:
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
-            logits_processors = _make_logits_processors(args)
+            logits_processors = _make_logits_processors(args, tokenizer)
 
             # Load the KV cache
             cache, rest = self.prompt_cache.fetch_nearest_cache(
@@ -1098,6 +1119,11 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+
+        # Grammar / structured output support (OpenAI-compatible response_format)
+        self.response_format = self.body.get("response_format", None)
+        self.grammar_args = self._parse_grammar_args()
+
         self.validate_model_parameters()
 
         # Get stop sequences
@@ -1108,6 +1134,41 @@ class APIHandler(BaseHTTPRequestHandler):
         # Create the completion request
         request = request_factories[self.path]()
         self.handle_completion(request, stop_words)
+
+    def _parse_grammar_args(self) -> Optional[GrammarArguments]:
+        """Parse grammar constraints from the request body."""
+        rf = self.response_format
+        if rf is None:
+            return None
+
+        rf_type = rf.get("type", "text")
+        if rf_type == "text":
+            return None
+
+        if rf_type == "json_object":
+            # Basic JSON object constraint (no specific schema)
+            return GrammarArguments(
+                json_schema={"type": "object"},
+            )
+
+        if rf_type == "json_schema":
+            schema = rf.get("json_schema", {})
+            # OpenAI nests the actual schema under "schema" key
+            if "schema" in schema:
+                schema = schema["schema"]
+            return GrammarArguments(json_schema=schema)
+
+        if rf_type == "regex":
+            pattern = rf.get("regex") or rf.get("pattern")
+            if pattern:
+                return GrammarArguments(regex=pattern)
+
+        if rf_type == "choices":
+            choices = rf.get("choices")
+            if choices:
+                return GrammarArguments(choices=choices)
+
+        return None
 
     def validate_model_parameters(self):
         """
@@ -1314,6 +1375,7 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            grammar=self.grammar_args,
         )
 
         # Create keepalive callback to send SSE comments during long prompt processing

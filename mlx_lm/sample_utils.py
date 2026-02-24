@@ -343,23 +343,34 @@ class GrammarLogitsProcessor:
         self._warn_on_empty = warn_on_empty_mask
         self._warned = False
         self._token_callback = None
+        self._prev_tokens_len = 0
 
     def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
         """
         Apply grammar constraint to logits.
 
         Args:
-            tokens: Previously generated tokens (shape: (seq_len,) or (batch, seq_len)).
-            logits: Logits from the model (shape: (batch, vocab_size)).
+            tokens: Accumulated tokens so far (prompt + generated).
+            logits: Logits from the model (shape: (batch, vocab_size) or (vocab_size,)).
 
         Returns:
             Constrained logits with -inf for disallowed tokens.
         """
-        # Update grammar with last token if we have generated tokens
-        if tokens.size > 0:
-            # Get last token
-            last_token = int(tokens.reshape(-1)[-1].item())
-            self.grammar.update(last_token)
+        # The generate_step function passes accumulated tokens (prompt tail + generated).
+        # On the first call, tokens contains prompt tokens - skip those.
+        # On subsequent calls, update grammar with each newly appended token.
+        tokens_flat = tokens.reshape(-1)
+        current_len = tokens_flat.size
+
+        if self._prev_tokens_len == 0:
+            # First call: these are prompt tokens, skip update
+            self._prev_tokens_len = current_len
+        else:
+            # Feed newly appended tokens to the grammar
+            for i in range(self._prev_tokens_len, current_len):
+                token_id = int(tokens_flat[i].item())
+                self.grammar.update(token_id)
+            self._prev_tokens_len = current_len
 
         # Check if complete
         if self.grammar.is_complete():
@@ -401,6 +412,7 @@ class GrammarLogitsProcessor:
     def reset(self):
         """Reset the grammar state for reuse."""
         self.grammar.reset()
+        self._prev_tokens_len = 0
         self._warned = False
 
 
