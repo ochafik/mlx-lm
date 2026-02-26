@@ -388,10 +388,9 @@ def get_tool_format_from_tokenizer(tokenizer) -> Optional[ToolCallFormat]:
     Returns:
         ToolCallFormat if tool calling is supported, None otherwise.
     """
-    # Handle TokenizerWrapper
-    actual_tokenizer = getattr(tokenizer, "_tokenizer", tokenizer)
-
-    template = getattr(actual_tokenizer, "chat_template", None)
+    # Try to get the chat_template from the tokenizer directly.
+    # Do NOT unwrap to ._tokenizer (fast tokenizer) as it lacks chat_template.
+    template = getattr(tokenizer, "chat_template", None)
     if not template:
         return None
 

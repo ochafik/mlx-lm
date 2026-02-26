@@ -6,6 +6,7 @@ import json
 import logging
 import pickle
 import platform
+import re
 import socket
 import time
 import uuid
@@ -336,6 +337,7 @@ class GrammarArguments:
     json_schema: Optional[Dict[str, Any]] = None
     regex: Optional[str] = None
     choices: Optional[List[str]] = None
+    tools: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -393,6 +395,183 @@ class Response:
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
+
+
+class _GrammarToolCallStreamer:
+    """Incrementally parse and stream grammar-constrained tool call JSON.
+
+    Grammar-constrained tool calling produces output like::
+
+        {"name":"get_weather","parameters":{"city":"London"}}
+
+    This class parses the output as tokens arrive and emits OpenAI-compatible
+    SSE chunks:
+
+    1. First chunk: function name + empty arguments
+    2. Argument delta chunks: incremental JSON fragments
+    3. Finish chunk: ``finish_reason="tool_calls"``
+
+    A JSON-aware depth tracker is used to find the exact boundary of the
+    arguments object, so this works regardless of field order.
+    """
+
+    _NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
+    _ARGS_RE = re.compile(r'"(?:arguments|parameters|params)"\s*:\s*')
+
+    def __init__(self, handler):
+        self._handler = handler
+        self._text = ""
+        self._name: Optional[str] = None
+        self._call_id = f"call_{uuid.uuid4().hex[:24]}"
+        # Arguments tracking
+        self._args_pos = -1   # index in _text where args value starts
+        self._args_end = -1   # exclusive end of args value (-1 = not found yet)
+        self._args_sent = 0   # chars of args already streamed
+        # JSON depth tracker (for finding args object boundary)
+        self._depth = 0
+        self._in_str = False
+        self._esc = False
+        self._scan_pos = 0
+
+    def feed(self, chunk: str):
+        """Feed a text chunk from the generator. May emit SSE chunks."""
+        self._text += chunk
+
+        # 1. Extract function name
+        if self._name is None:
+            m = self._NAME_RE.search(self._text)
+            if m:
+                self._name = m.group(1)
+                self._emit_name()
+
+        # 2. Locate start of arguments value
+        if self._name is not None and self._args_pos < 0:
+            m = self._ARGS_RE.search(self._text)
+            if m:
+                self._args_pos = m.end()
+                self._scan_pos = self._args_pos
+
+        # 3. Scan for arguments object/array boundary (depth tracking)
+        if self._args_pos >= 0 and self._args_end < 0:
+            end = len(self._text)
+            i = self._scan_pos
+            while i < end:
+                c = self._text[i]
+                if self._esc:
+                    self._esc = False
+                elif c == "\\" and self._in_str:
+                    self._esc = True
+                elif c == '"':
+                    self._in_str = not self._in_str
+                elif not self._in_str:
+                    if c in ("{", "["):
+                        self._depth += 1
+                    elif c in ("}", "]"):
+                        self._depth -= 1
+                        if self._depth == 0:
+                            self._args_end = i + 1
+                            i += 1
+                            break
+                i += 1
+            self._scan_pos = i
+
+        # 4. Stream argument deltas
+        self._flush_args()
+
+    def finalize(self):
+        """Flush remaining args and send the finish chunk."""
+        if self._args_pos >= 0:
+            # Send anything still buffered
+            limit = self._args_end if self._args_end >= 0 else len(self._text)
+            remaining = self._text[self._args_pos + self._args_sent : limit]
+            if remaining:
+                self._emit_args(remaining)
+
+        self._emit_finish()
+
+    @property
+    def active(self) -> bool:
+        """Whether any tool call content has been streamed."""
+        return self._name is not None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _flush_args(self):
+        if self._args_pos < 0:
+            return
+        if self._args_end >= 0:
+            # Boundary known — send everything up to it
+            sendable = self._args_end - self._args_pos
+        else:
+            # Boundary unknown — hold back 1 char (might be outer })
+            sendable = max(0, len(self._text) - self._args_pos - 1)
+        if sendable > self._args_sent:
+            delta = self._text[
+                self._args_pos + self._args_sent : self._args_pos + sendable
+            ]
+            self._args_sent = sendable
+            if delta:
+                self._emit_args(delta)
+
+    def _make_sse(self, choice_fields: dict) -> dict:
+        h = self._handler
+        return {
+            "id": h.request_id,
+            "system_fingerprint": h.system_fingerprint,
+            "object": h.object_type,
+            "model": h.requested_model,
+            "created": h.created,
+            "choices": [{"index": 0, **choice_fields}],
+        }
+
+    def _emit_name(self):
+        data = self._make_sse(
+            {
+                "finish_reason": None,
+                "delta": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": self._call_id,
+                            "type": "function",
+                            "function": {
+                                "name": self._name,
+                                "arguments": "",
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+        self._send(data)
+
+    def _emit_args(self, delta: str):
+        data = self._make_sse(
+            {
+                "finish_reason": None,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "function": {"arguments": delta},
+                        }
+                    ],
+                },
+            }
+        )
+        self._send(data)
+
+    def _emit_finish(self):
+        data = self._make_sse({"finish_reason": "tool_calls", "delta": {}})
+        self._send(data)
+
+    def _send(self, data):
+        self._handler.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
+        self._handler.wfile.flush()
 
 
 class TimeBudget:
@@ -567,7 +746,7 @@ def _make_logits_processors(args, tokenizer=None):
     )
     if args.grammar is not None and tokenizer is not None:
         g = args.grammar
-        if g.json_schema or g.regex or g.choices:
+        if g.json_schema or g.regex or g.choices or g.tools:
             from .sample_utils import make_grammar_logits_processor
 
             grammar_proc = make_grammar_logits_processor(
@@ -575,6 +754,7 @@ def _make_logits_processors(args, tokenizer=None):
                 json_schema=g.json_schema,
                 regex=g.regex,
                 choices=g.choices,
+                tools=g.tools,
             )
             processors = (processors or []) + [grammar_proc]
     return processors
@@ -1136,37 +1316,61 @@ class APIHandler(BaseHTTPRequestHandler):
         self.handle_completion(request, stop_words)
 
     def _parse_grammar_args(self) -> Optional[GrammarArguments]:
-        """Parse grammar constraints from the request body."""
+        """Parse grammar constraints from the request body.
+
+        Handles two sources of grammar constraints:
+        1. ``response_format`` (JSON schema, regex, choices)
+        2. ``tool_choice`` with ``tools`` — when ``tool_choice`` is
+           ``"required"`` or specifies a function, grammar-constrain
+           the output to valid tool calls.
+        """
+        # 1. Parse response_format constraints
         rf = self.response_format
-        if rf is None:
-            return None
+        if rf is not None:
+            rf_type = rf.get("type", "text")
 
-        rf_type = rf.get("type", "text")
-        if rf_type == "text":
-            return None
+            if rf_type == "json_object":
+                return GrammarArguments(json_schema={"type": "object"})
 
-        if rf_type == "json_object":
-            # Basic JSON object constraint (no specific schema)
-            return GrammarArguments(
-                json_schema={"type": "object"},
-            )
+            if rf_type == "json_schema":
+                schema = rf.get("json_schema", {})
+                if "schema" in schema:
+                    schema = schema["schema"]
+                return GrammarArguments(json_schema=schema)
 
-        if rf_type == "json_schema":
-            schema = rf.get("json_schema", {})
-            # OpenAI nests the actual schema under "schema" key
-            if "schema" in schema:
-                schema = schema["schema"]
-            return GrammarArguments(json_schema=schema)
+            if rf_type == "regex":
+                pattern = rf.get("regex") or rf.get("pattern")
+                if pattern:
+                    return GrammarArguments(regex=pattern)
 
-        if rf_type == "regex":
-            pattern = rf.get("regex") or rf.get("pattern")
-            if pattern:
-                return GrammarArguments(regex=pattern)
+            if rf_type == "choices":
+                choices = rf.get("choices")
+                if choices:
+                    return GrammarArguments(choices=choices)
 
-        if rf_type == "choices":
-            choices = rf.get("choices")
-            if choices:
-                return GrammarArguments(choices=choices)
+        # 2. Parse tool_choice + tools for grammar-constrained tool calling
+        tools = self.body.get("tools")
+        tool_choice = self.body.get("tool_choice", "auto")
+        if tools and tool_choice != "auto" and tool_choice != "none":
+            # Normalize tool definitions to the format expected by build_tool_grammar
+            normalized = []
+            for t in tools:
+                if t.get("type") == "function" and "function" in t:
+                    normalized.append(t["function"])
+                else:
+                    normalized.append(t)
+
+            if tool_choice == "required":
+                return GrammarArguments(tools=normalized)
+
+            # tool_choice = {"type": "function", "function": {"name": "..."}}
+            if isinstance(tool_choice, dict):
+                fn = tool_choice.get("function", {})
+                fn_name = fn.get("name") if isinstance(fn, dict) else None
+                if fn_name:
+                    filtered = [t for t in normalized if t.get("name") == fn_name]
+                    if filtered:
+                        return GrammarArguments(tools=filtered)
 
         return None
 
@@ -1418,11 +1622,27 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Variables to save the tool calls in as they are being generated by
         # the model.
-        in_tool_call = False
-        made_tool_call = False
         tool_calls = []
         tool_text = ""
         tool_idx = 0
+
+        # Grammar-constrained tool calling: when grammar_args.tools is set,
+        # the grammar forces the entire output to be valid tool call JSON.
+        # No start/end markers are emitted, so we treat all output as a
+        # tool call and parse it with parse_tool_call_output at the end.
+        grammar_tool_mode = (
+            self.grammar_args is not None
+            and self.grammar_args.tools is not None
+        )
+        in_tool_call = grammar_tool_mode
+        made_tool_call = grammar_tool_mode
+
+        # Incremental streamer for grammar-constrained tool calls
+        tc_streamer = (
+            _GrammarToolCallStreamer(self)
+            if grammar_tool_mode and self.stream
+            else None
+        )
 
         def format_tool_call(tool_call):
             nonlocal tool_idx
@@ -1444,12 +1664,25 @@ class APIHandler(BaseHTTPRequestHandler):
             if not tool_calls:
                 return []
             result = []
-            for tool_text in tool_calls:
-                parsed = ctx.tool_parser(tool_text, request.tools)
-                if isinstance(parsed, list):
-                    result.extend(format_tool_call(tc) for tc in parsed)
-                else:
-                    result.append(format_tool_call(parsed))
+            if grammar_tool_mode:
+                # Grammar-constrained: output is valid JSON, parse directly
+                from .grammar.tool_schema import parse_tool_call_output
+
+                for tc_text in tool_calls:
+                    try:
+                        parsed = parse_tool_call_output(tc_text)
+                        result.append(format_tool_call(parsed))
+                    except (json.JSONDecodeError, KeyError) as e:
+                        logging.warning(
+                            f"Failed to parse grammar-constrained tool call: {e}"
+                        )
+            else:
+                for tc_text in tool_calls:
+                    parsed = ctx.tool_parser(tc_text, request.tools)
+                    if isinstance(parsed, list):
+                        result.extend(format_tool_call(tc) for tc in parsed)
+                    else:
+                        result.append(format_tool_call(parsed))
             return result
 
         # Start out in reasoning if the model is a reasoning model and the
@@ -1485,6 +1718,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     in_reasoning = False
                 else:
                     reasoning_text += gen.text
+            elif grammar_tool_mode:
+                # Grammar-constrained tool calling: all output is the tool
+                # call JSON (no markers). Accumulate and optionally stream.
+                tool_text += gen.text
+                if tc_streamer is not None:
+                    tc_streamer.feed(gen.text)
             elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
                 made_tool_call = True
                 in_tool_call = True
@@ -1549,46 +1788,73 @@ class APIHandler(BaseHTTPRequestHandler):
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
 
-        # Flush any remaining tool text (e.g. when tool_call_end is empty)
-        if in_tool_call and tool_text:
-            tool_calls.append(tool_text)
+        # In grammar_tool_mode, override finish_reason to "tool_calls"
+        if grammar_tool_mode and tool_text:
+            finish_reason = "tool_calls"
 
-        if self.stream:
-            response = self.generate_response(
-                segment,
-                finish_reason,
-                tool_calls=parse_tools(tool_calls),
-                reasoning_text=reasoning_text,
-            )
-            self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-            self.wfile.flush()
+        # Incremental streaming was handled by tc_streamer; finalize and
+        # skip the normal streaming/non-streaming path.
+        if tc_streamer is not None and tc_streamer.active:
+            tc_streamer.finalize()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(len(ctx.prompt), len(tokens))
+                response = self.completion_usage_response(
+                    len(ctx.prompt), len(tokens)
+                )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
             self.wfile.write("data: [DONE]\n\n".encode())
             self.wfile.flush()
-        else:
-            response = self.generate_response(
-                text,
-                finish_reason,
-                len(ctx.prompt),
-                len(tokens),
-                token_logprobs=token_logprobs,
-                top_tokens=top_tokens,
-                tokens=tokens,
-                reasoning_text=reasoning_text,
-                tool_calls=parse_tools(tool_calls),
-            )
-            response_json = json.dumps(response).encode()
-            indent = "\t"  # Backslashes can't be inside of f-strings
-            logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
 
-            # Send an additional Content-Length header when it is known
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json)
-            self.wfile.flush()
+        else:
+            # Flush any remaining tool text (e.g. when tool_call_end is
+            # empty, or grammar_tool_mode non-streaming)
+            if (in_tool_call or grammar_tool_mode) and tool_text:
+                tool_calls.append(tool_text)
+
+            if self.stream:
+                response = self.generate_response(
+                    segment,
+                    finish_reason,
+                    tool_calls=parse_tools(tool_calls),
+                    reasoning_text=reasoning_text,
+                )
+                self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                self.wfile.flush()
+                if self.stream_options is not None and self.stream_options[
+                    "include_usage"
+                ]:
+                    response = self.completion_usage_response(
+                        len(ctx.prompt), len(tokens)
+                    )
+                    self.wfile.write(
+                        f"data: {json.dumps(response)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                self.wfile.write("data: [DONE]\n\n".encode())
+                self.wfile.flush()
+            else:
+                response = self.generate_response(
+                    text,
+                    finish_reason,
+                    len(ctx.prompt),
+                    len(tokens),
+                    token_logprobs=token_logprobs,
+                    top_tokens=top_tokens,
+                    tokens=tokens,
+                    reasoning_text=reasoning_text,
+                    tool_calls=parse_tools(tool_calls),
+                )
+                response_json = json.dumps(response).encode()
+                indent = "\t"  # Backslashes can't be inside of f-strings
+                logging.debug(
+                    f"Outgoing Response: {json.dumps(response, indent=indent)}"
+                )
+
+                # Send an additional Content-Length header when it is known
+                self.send_header("Content-Length", str(len(response_json)))
+                self.end_headers()
+                self.wfile.write(response_json)
+                self.wfile.flush()
 
     def completion_usage_response(
         self,

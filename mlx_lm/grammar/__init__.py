@@ -28,7 +28,9 @@ from .jinja_analysis import (
 )
 from .tool_schema import (
     build_tool_grammar,
+    build_tool_schema,
     build_multi_tool_grammar,
+    parse_tool_call_output,
     tools_from_functions,
 )
 
@@ -67,6 +69,8 @@ __all__ = [
     "get_tool_format_from_tokenizer",
     # Tool schema
     "build_tool_grammar",
+    "build_tool_schema",
     "build_multi_tool_grammar",
+    "parse_tool_call_output",
     "tools_from_functions",
 ]

@@ -264,6 +264,92 @@ def _json_schema_to_lark(schema: Dict[str, Any]) -> str:
     return "/.+/"
 
 
+def build_tool_schema(
+    tools: List[Dict[str, Any]],
+    tokenizer=None,
+    format_override: Optional[ToolCallFormat] = None,
+) -> Tuple[Dict[str, Any], ToolCallFormat]:
+    """
+    Build a JSON schema for tool call output.
+
+    This is the **single source of truth** for grammar-constrained tool
+    calling.  The returned schema is used for:
+
+    1. **Constraining** — passed to ``llguidance.grammar_from("json_schema", ...)``
+    2. **Parsing** — the generated output is guaranteed to be valid JSON
+       matching this schema, so ``json.loads`` + field extraction is all that
+       is needed (see :func:`parse_tool_call_output`).
+
+    Args:
+        tools: Tool definitions (``{"name": ..., "parameters": ...}``).
+        tokenizer: Optional tokenizer for auto-detecting the format.
+        format_override: Explicit format to use instead of auto-detection.
+
+    Returns:
+        ``(schema_dict, format)`` where *schema_dict* is the combined JSON
+        schema and *format* carries field-name metadata for parsing.
+    """
+    if format_override:
+        fmt = format_override
+    elif tokenizer:
+        fmt = get_tool_format_from_tokenizer(tokenizer)
+    else:
+        fmt = None
+
+    if not fmt:
+        fmt = ToolCallFormat(format_type="json")
+
+    tool_schemas = [_build_single_tool_schema(tool, fmt) for tool in tools]
+    combined = tool_schemas[0] if len(tool_schemas) == 1 else {"anyOf": tool_schemas}
+    return combined, fmt
+
+
+def parse_tool_call_output(
+    text: str,
+    fmt: Optional[ToolCallFormat] = None,
+) -> Dict[str, Any]:
+    """
+    Parse grammar-constrained tool call output into an OpenAI-style dict.
+
+    Because the output was generated under a JSON-schema grammar constraint,
+    it is guaranteed to be valid JSON.  This function simply loads it and
+    normalises the field names to ``{"name": ..., "arguments": {...}}``.
+
+    Args:
+        text: The raw model output (must be valid JSON).
+        fmt: The ``ToolCallFormat`` that was used for constraining.  If
+            ``None``, common field names are tried automatically.
+
+    Returns:
+        ``{"name": str, "arguments": dict}``
+    """
+    parsed = json.loads(text.strip())
+
+    # Handle nested function field (e.g. {"function": {"name": ..., "arguments": ...}})
+    if "function" in parsed and isinstance(parsed["function"], dict):
+        inner = parsed["function"]
+        args = inner.get("arguments") or inner.get("parameters") or {}
+        return {"name": inner.get("name"), "arguments": args}
+
+    name_field = fmt.name_field if fmt else "name"
+    args_field = fmt.arguments_field if fmt else "arguments"
+
+    name = parsed.get(name_field)
+    args = parsed.get(args_field)
+
+    # Fallback: try common argument field names
+    if args is None:
+        for field in ("arguments", "parameters", "params"):
+            if field in parsed:
+                args = parsed[field]
+                break
+
+    return {
+        "name": name,
+        "arguments": args or {},
+    }
+
+
 def _escape_for_lark(s: str) -> str:
     """Escape special characters for Lark string literals."""
     # Escape backslashes first, then quotes

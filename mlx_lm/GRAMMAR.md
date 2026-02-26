@@ -210,6 +210,110 @@ mlx_lm/sample_utils.py    # GrammarLogitsProcessor, make_grammar_logits_processo
 
 ## Tool Calling (Experimental)
 
-The grammar module can auto-detect tool call formats from chat templates and
-generate grammars for structured tool calling. See `LLGuidanceState.from_tools()`
-and `build_tool_grammar()`. This is not yet wired to the CLI or server.
+Grammar-constrained tool calling forces the model to produce syntactically valid
+tool calls that conform to the provided tool definitions. The format is
+auto-detected from the model's chat template.
+
+### CLI
+
+Pass tool definitions as JSON (or `@file.json`):
+
+```bash
+mlx_lm generate \
+  --model mlx-community/Llama-3.2-3B-Instruct-4bit \
+  --tools '[{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]' \
+  -p "What is the weather in London?"
+```
+
+Or from a file:
+
+```bash
+mlx_lm generate --tools @tools.json -p "What is the weather in London?"
+```
+
+### Server (OpenAI-Compatible API)
+
+Use `tool_choice` to enable grammar-constrained tool calling:
+
+```bash
+# tool_choice: "required" — force a valid tool call
+curl localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "What is the weather in London?"}],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+          }
+        }
+      }
+    ],
+    "tool_choice": "required"
+  }'
+
+# tool_choice: specific function — force a specific tool
+curl localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Weather in Paris?"}],
+    "tools": [...],
+    "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+  }'
+```
+
+**`tool_choice` values:**
+
+| Value | Grammar Constraint | Behavior |
+|-------|-------------------|----------|
+| `"auto"` (default) | No | Model decides freely whether to call tools |
+| `"required"` | Yes | Forces valid tool call output |
+| `{"type":"function","function":{"name":"..."}}` | Yes | Forces specific tool |
+| `"none"` | No | Tools ignored |
+
+### Python API
+
+```python
+from mlx_lm import load, generate
+from mlx_lm.sample_utils import make_grammar_logits_processor, make_sampler
+
+model, tokenizer = load("mlx-community/Llama-3.2-3B-Instruct-4bit")
+
+tools = [
+    {
+        "name": "get_weather",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    }
+]
+
+processor = make_grammar_logits_processor(tokenizer, tools=tools)
+prompt = tokenizer.apply_chat_template(
+    [{"role": "user", "content": "Weather in London?"}],
+    tokenize=False, add_generation_prompt=True, tools=tools,
+)
+tokens = tokenizer.encode(prompt, add_special_tokens=False)
+
+response = generate(
+    model, tokenizer, tokens,
+    max_tokens=100, sampler=make_sampler(0.0),
+    logits_processors=[processor], verbose=False,
+)
+print(response)
+```
+
+### How It Works
+
+1. `jinja_analysis.py` analyzes the model's chat template to detect the tool
+   call format (JSON, XML, or Python-style).
+2. `tool_schema.py` converts tool definitions into a Lark grammar matching the
+   detected format.
+3. The grammar constrains generation to produce only valid tool calls.

@@ -181,6 +181,13 @@ def setup_arg_parser():
         help="Regular expression to constrain output",
     )
     grammar_group.add_argument(
+        "--tools",
+        type=str,
+        default=None,
+        help="Tool definitions for grammar-constrained tool calling "
+        "(as JSON string or @file.json). Forces tool call output.",
+    )
+    grammar_group.add_argument(
         "--choices",
         type=str,
         nargs="+",
@@ -1439,11 +1446,20 @@ def main():
         has_prefill = args.prefill_response is not None
         if has_prefill:
             messages.append({"role": "assistant", "content": args.prefill_response})
+        # Include tool definitions in the chat template if --tools is used
+        chat_tools = None
+        if args.tools is not None:
+            tools_str = args.tools
+            if tools_str.startswith("@"):
+                with open(tools_str[1:]) as f:
+                    tools_str = f.read()
+            chat_tools = json.loads(tools_str)
         prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             continue_final_message=has_prefill,
             add_generation_prompt=not has_prefill,
+            tools=chat_tools,
             **template_kwargs,
         )
 
@@ -1485,16 +1501,35 @@ def main():
     if json_schema is not None and json_schema.startswith("@"):
         with open(json_schema[1:]) as f:
             json_schema = f.read()
-    if json_schema is not None or args.grammar is not None or args.regex is not None or args.choices is not None:
+    tools_json = args.tools
+    if tools_json is not None and tools_json.startswith("@"):
+        with open(tools_json[1:]) as f:
+            tools_json = f.read()
+    has_grammar = any([
+        json_schema is not None,
+        args.grammar is not None,
+        args.regex is not None,
+        args.choices is not None,
+        tools_json is not None,
+    ])
+    if has_grammar:
         from .sample_utils import make_grammar_logits_processor
 
         json_schema_dict = json.loads(json_schema) if json_schema else None
+        tools_list = json.loads(tools_json) if tools_json else None
+        # Normalize OpenAI-style tool definitions
+        if tools_list is not None:
+            tools_list = [
+                t["function"] if t.get("type") == "function" and "function" in t else t
+                for t in tools_list
+            ]
         processor = make_grammar_logits_processor(
             tokenizer,
             json_schema=json_schema_dict,
             grammar=args.grammar,
             regex=args.regex,
             choices=args.choices,
+            tools=tools_list,
         )
         logits_processors = [processor]
 

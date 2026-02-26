@@ -213,13 +213,18 @@ class LLGuidanceState(GrammarState):
         """
         Create grammar state for tool calling.
 
+        Uses :func:`build_tool_schema` to build a JSON schema and then
+        ``grammar_from("json_schema", ...)`` for reliable constraining.
+
         Args:
             tokenizer: HuggingFace tokenizer with chat_template.
             tools: List of tool definitions.
         """
-        from .tool_schema import build_tool_grammar
+        from .tool_schema import build_tool_schema
 
-        grammar = build_tool_grammar(tools, tokenizer)
+        llg = _get_llguidance()
+        schema, _fmt = build_tool_schema(tools, tokenizer)
+        grammar = llg.grammar_from("json_schema", json.dumps(schema))
         return cls(tokenizer, grammar, **kwargs)
 
     def get_token_mask(self) -> mx.array:

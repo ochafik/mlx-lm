@@ -106,6 +106,13 @@ def setup_arg_parser():
         help="Regular expression to constrain output",
     )
     grammar_group.add_argument(
+        "--tools",
+        type=str,
+        default=None,
+        help="Tool definitions for grammar-constrained tool calling "
+        "(as JSON string or @file.json). Forces tool call output.",
+    )
+    grammar_group.add_argument(
         "--choices",
         type=str,
         nargs="+",
@@ -155,16 +162,34 @@ def main():
     if json_schema is not None and json_schema.startswith("@"):
         with open(json_schema[1:]) as f:
             json_schema = f.read()
-    if json_schema is not None or args.grammar is not None or args.regex is not None or args.choices is not None:
+    tools_json = args.tools
+    if tools_json is not None and tools_json.startswith("@"):
+        with open(tools_json[1:]) as f:
+            tools_json = f.read()
+    has_grammar = any([
+        json_schema is not None,
+        args.grammar is not None,
+        args.regex is not None,
+        args.choices is not None,
+        tools_json is not None,
+    ])
+    if has_grammar:
         from .sample_utils import make_grammar_logits_processor
 
         json_schema_dict = json.loads(json_schema) if json_schema else None
+        tools_list = json.loads(tools_json) if tools_json else None
+        if tools_list is not None:
+            tools_list = [
+                t["function"] if t.get("type") == "function" and "function" in t else t
+                for t in tools_list
+            ]
         grammar_processor = make_grammar_logits_processor(
             tokenizer,
             json_schema=json_schema_dict,
             grammar=args.grammar,
             regex=args.regex,
             choices=args.choices,
+            tools=tools_list,
         )
 
     rprint(f"[INFO] Starting chat session with {args.model}.")
@@ -186,9 +211,18 @@ def main():
         if args.system_prompt is not None:
             messages.append({"role": "system", "content": args.system_prompt})
         messages.append({"role": "user", "content": query})
+        # Include tool definitions in the chat template if --tools is used
+        chat_tools = None
+        if args.tools is not None:
+            t = args.tools
+            if t.startswith("@"):
+                with open(t[1:]) as f:
+                    t = f.read()
+            chat_tools = json.loads(t)
         prompt = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
+            tools=chat_tools,
         )
         logits_processors = None
         if grammar_processor is not None:

@@ -724,5 +724,159 @@ class TestEndToEndGeneration:
         assert response.strip() in ("red", "blue", "green")
 
 
+class TestToolCallingIntegration:
+    """Test grammar-constrained tool calling."""
+
+    def test_cli_tools_arg(self):
+        """Test that --tools CLI arg is parsed correctly."""
+        from mlx_lm.generate import setup_arg_parser
+
+        parser = setup_arg_parser()
+        args = parser.parse_args([
+            "--tools", '[{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}]',
+            "--prompt", "test",
+        ])
+        assert args.tools is not None
+        assert "get_weather" in args.tools
+
+    def test_cli_tools_mutually_exclusive_with_regex(self):
+        """Test that --tools is mutually exclusive with other grammar args."""
+        from mlx_lm.generate import setup_arg_parser
+
+        parser = setup_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--tools", "[]", "--regex", "abc", "--prompt", "test"])
+
+    def test_chat_tools_arg(self):
+        """Test that chat.py --tools arg is parsed correctly."""
+        from mlx_lm.chat import setup_arg_parser
+
+        parser = setup_arg_parser()
+        args = parser.parse_args([
+            "--tools", '[{"name":"search","parameters":{}}]',
+        ])
+        assert args.tools is not None
+
+    def test_server_tool_choice_required(self):
+        """Test that tool_choice=required creates grammar args from tools."""
+        from mlx_lm.server import GrammarArguments
+        from unittest.mock import MagicMock
+
+        # Create a mock handler with the right attributes
+        handler = MagicMock()
+        handler.response_format = None
+        handler.body = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "required",
+        }
+
+        # Import and call the method directly
+        from mlx_lm.server import APIHandler
+        result = APIHandler._parse_grammar_args(handler)
+
+        assert result is not None
+        assert result.tools is not None
+        assert len(result.tools) == 1
+        assert result.tools[0]["name"] == "get_weather"
+
+    def test_server_tool_choice_auto_no_grammar(self):
+        """Test that tool_choice=auto does not create grammar args."""
+        from unittest.mock import MagicMock
+        from mlx_lm.server import APIHandler
+
+        handler = MagicMock()
+        handler.response_format = None
+        handler.body = {
+            "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+            "tool_choice": "auto",
+        }
+
+        result = APIHandler._parse_grammar_args(handler)
+        assert result is None
+
+    def test_server_tool_choice_specific_function(self):
+        """Test that tool_choice with specific function filters tools."""
+        from unittest.mock import MagicMock
+        from mlx_lm.server import APIHandler
+
+        handler = MagicMock()
+        handler.response_format = None
+        handler.body = {
+            "tools": [
+                {"type": "function", "function": {"name": "search", "parameters": {}}},
+                {"type": "function", "function": {"name": "get_weather", "parameters": {}}},
+            ],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "get_weather"},
+            },
+        }
+
+        result = APIHandler._parse_grammar_args(handler)
+        assert result is not None
+        assert result.tools is not None
+        assert len(result.tools) == 1
+        assert result.tools[0]["name"] == "get_weather"
+
+    def test_server_tool_choice_none_no_grammar(self):
+        """Test that tool_choice=none does not create grammar args."""
+        from unittest.mock import MagicMock
+        from mlx_lm.server import APIHandler
+
+        handler = MagicMock()
+        handler.response_format = None
+        handler.body = {
+            "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+            "tool_choice": "none",
+        }
+
+        result = APIHandler._parse_grammar_args(handler)
+        assert result is None
+
+    def test_grammar_arguments_tools_field(self):
+        """Test GrammarArguments supports tools field."""
+        from mlx_lm.server import GrammarArguments
+
+        tools = [{"name": "test", "parameters": {"type": "object"}}]
+        args = GrammarArguments(tools=tools)
+        assert args.tools == tools
+        assert args.json_schema is None
+
+    def test_make_grammar_logits_processor_with_tools(self):
+        """Test make_grammar_logits_processor with tools parameter."""
+        pytest.importorskip("llguidance")
+        from transformers import AutoTokenizer
+        from mlx_lm.sample_utils import make_grammar_logits_processor
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            "mlx-community/Llama-3.2-1B-Instruct-4bit"
+        )
+        tools = [
+            {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            }
+        ]
+        processor = make_grammar_logits_processor(tokenizer, tools=tools)
+        assert processor is not None
+        assert not processor.is_complete
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
