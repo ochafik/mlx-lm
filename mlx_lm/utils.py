@@ -933,6 +933,16 @@ def save(
         for file in glob.glob(str(src_path / p)):
             shutil.copy(file, dst_path)
 
+    # Copy any additional vocab files referenced by the tokenizer
+    # (e.g. rwkv_vocab_v20230424.txt for RWKV7 custom tokenizers)
+    # that save_pretrained may not have saved.
+    vocab_files = getattr(tokenizer, "vocab_files_names", {})
+    for vocab_file in vocab_files.values():
+        src_vocab = src_path / vocab_file
+        dst_vocab = dst_path / vocab_file
+        if src_vocab.exists() and not dst_vocab.exists():
+            shutil.copy(str(src_vocab), str(dst_vocab))
+
     create_model_card(dst_path, hf_repo)
 
 
