@@ -9,6 +9,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from . import qwen3_moe
 from .base import BaseModelArgs
+from .switch_layers import fuse_gate_up_weights
 
 
 @dataclass
@@ -54,17 +55,19 @@ class Model(nn.Module):
             prefix = f"language_model.model.layers.{l}.mlp"
             gate_up_key = f"{prefix}.experts.gate_up_proj"
             if gate_up_key in weights:
+                # Keep gate+up fused, just transpose
                 gate_up = weights.pop(gate_up_key)
-                mid = gate_up.shape[-1] // 2
-                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
-                    ..., :mid
-                ].swapaxes(-2, -1)
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
-                    ..., mid:
-                ].swapaxes(-2, -1)
+                weights[f"{prefix}.switch_mlp.gate_up_proj.weight"] = gate_up.swapaxes(
+                    -2, -1
+                )
                 weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
                     f"{prefix}.experts.down_proj"
                 ).swapaxes(-2, -1)
+            else:
+                # Handle legacy format with separate gate_proj/up_proj
+                fuse_gate_up_weights(
+                    weights, f"{prefix}.switch_mlp"
+                )
 
         return weights
 

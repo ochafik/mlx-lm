@@ -157,6 +157,31 @@ class SwiGLU(nn.Module):
         return swiglu(gate, x)
 
 
+def fuse_gate_up_weights(weights, prefix):
+    """Fuse separate gate_proj/up_proj weights into gate_up_proj for SwitchGLU.
+
+    Handles both unquantized and quantized weights. Concatenates along the
+    output dimension (axis=1), which is valid because quantization is per-row.
+    """
+    gate_key = f"{prefix}.gate_proj.weight"
+    if gate_key not in weights:
+        return
+    for suffix in ["weight", "scales", "biases"]:
+        g = f"{prefix}.gate_proj.{suffix}"
+        u = f"{prefix}.up_proj.{suffix}"
+        if g in weights and u in weights:
+            weights[f"{prefix}.gate_up_proj.{suffix}"] = mx.concatenate(
+                [weights.pop(g), weights.pop(u)], axis=1
+            )
+    # Handle bias
+    g_bias = f"{prefix}.gate_proj.bias"
+    u_bias = f"{prefix}.up_proj.bias"
+    if g_bias in weights and u_bias in weights:
+        weights[f"{prefix}.gate_up_proj.bias"] = mx.concatenate(
+            [weights.pop(g_bias), weights.pop(u_bias)], axis=1
+        )
+
+
 class SwitchGLU(nn.Module):
     def __init__(
         self,
@@ -165,11 +190,21 @@ class SwitchGLU(nn.Module):
         num_experts: int,
         activation=SwiGLU(),
         bias: bool = False,
+        fuse_gate_up: bool = False,
     ):
         super().__init__()
 
-        self.gate_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
-        self.up_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
+        if fuse_gate_up:
+            self.gate_up_proj = SwitchLinear(
+                input_dims, 2 * hidden_dims, num_experts, bias=bias
+            )
+        else:
+            self.gate_proj = SwitchLinear(
+                input_dims, hidden_dims, num_experts, bias=bias
+            )
+            self.up_proj = SwitchLinear(
+                input_dims, hidden_dims, num_experts, bias=bias
+            )
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
@@ -185,8 +220,14 @@ class SwitchGLU(nn.Module):
             x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+
+        if hasattr(self, "gate_up_proj"):
+            gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
+            x_gate, x_up = mx.split(gate_up, 2, axis=-1)
+        else:
+            x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+            x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+
         x = self.down_proj(
             self.activation(x_up, x_gate),
             idx,

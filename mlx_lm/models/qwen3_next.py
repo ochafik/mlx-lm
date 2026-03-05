@@ -18,7 +18,7 @@ from .base import (
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, fuse_gate_up_weights
 
 
 @dataclass
@@ -307,7 +307,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.top_k = args.num_experts_per_tok
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
-        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+        self.switch_mlp = SwitchGLU(
+            dim, intermediate_size, num_experts, fuse_gate_up=True
+        )
 
         self.shared_expert = Qwen3NextMLP(dim, shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
@@ -325,13 +327,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
 
+        # Launch routed and shared expert computation together
+        # so MLX's lazy evaluation can overlap them
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
-
         shared_y = self.shared_expert(x)
-        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+        shared_gate = mx.sigmoid(self.shared_expert_gate(x))
 
-        return y + shared_y
+        y = (y * scores[..., None]).sum(axis=-2)
+        return y + shared_gate * shared_y
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -430,35 +433,56 @@ class Model(nn.Module):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
-        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
-            return weights
-        weights = {key: value for key, value in weights.items() if "mtp." not in key}
+        if "model.layers.0.mlp.experts.0.up_proj.weight" in weights:
+            # Raw per-expert checkpoint format
+            weights = {
+                key: value for key, value in weights.items() if "mtp." not in key
+            }
 
-        if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
+            if self.args.tie_word_embeddings:
+                weights.pop("lm_head.weight", None)
 
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}.mlp"
-            for n in ["up_proj", "down_proj", "gate_proj"]:
-                to_join = [
-                    weights.pop(f"{prefix}.experts.{e}.{n}.weight")
+            for l in range(self.args.num_hidden_layers):
+                prefix = f"model.layers.{l}.mlp"
+                if f"{prefix}.experts.0.up_proj.weight" not in weights:
+                    continue
+                # Fuse gate + up into single weight
+                gate_ws = [
+                    weights.pop(f"{prefix}.experts.{e}.gate_proj.weight")
                     for e in range(self.args.num_experts)
                 ]
-                weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
+                up_ws = [
+                    weights.pop(f"{prefix}.experts.{e}.up_proj.weight")
+                    for e in range(self.args.num_experts)
+                ]
+                weights[f"{prefix}.switch_mlp.gate_up_proj.weight"] = mx.concatenate(
+                    [mx.stack(gate_ws), mx.stack(up_ws)], axis=1
+                )
+                down_ws = [
+                    weights.pop(f"{prefix}.experts.{e}.down_proj.weight")
+                    for e in range(self.args.num_experts)
+                ]
+                weights[f"{prefix}.switch_mlp.down_proj.weight"] = mx.stack(down_ws)
 
-        norm_keys = (
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            "model.norm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        )
-        for k, v in weights.items():
-            if "conv1d.weight" in k and v.shape[-1] != 1:
-                weights[k] = v.moveaxis(2, 1)
-            if any(k.endswith(sfx) for sfx in norm_keys):
-                if v.ndim == 1:
-                    weights[k] = v + 1.0
+            norm_keys = (
+                ".input_layernorm.weight",
+                ".post_attention_layernorm.weight",
+                "model.norm.weight",
+                ".q_norm.weight",
+                ".k_norm.weight",
+            )
+            for k, v in weights.items():
+                if "conv1d.weight" in k and v.shape[-1] != 1:
+                    weights[k] = v.moveaxis(2, 1)
+                if any(k.endswith(sfx) for sfx in norm_keys):
+                    if v.ndim == 1:
+                        weights[k] = v + 1.0
+            return weights
+
+        # Handle legacy format with separate gate_proj/up_proj
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}.mlp.switch_mlp"
+            fuse_gate_up_weights(weights, prefix)
         return weights
 
     @property

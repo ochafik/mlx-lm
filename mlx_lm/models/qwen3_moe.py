@@ -8,7 +8,7 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, fuse_gate_up_weights
 
 
 @dataclass
@@ -118,7 +118,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.norm_topk_prob = args.norm_topk_prob
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
-        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+        self.switch_mlp = SwitchGLU(
+            dim, intermediate_size, num_experts, fuse_gate_up=True
+        )
 
     def __call__(
         self,
@@ -232,17 +234,33 @@ class Model(nn.Module):
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
+        if "model.layers.0.mlp.experts.0.up_proj.weight" in weights:
+            for l in range(self.args.num_hidden_layers):
+                prefix = f"model.layers.{l}.mlp"
+                if f"{prefix}.experts.0.up_proj.weight" not in weights:
+                    continue
+                # Fuse gate + up into single weight
+                gate_ws = [
+                    weights.pop(f"{prefix}.experts.{e}.gate_proj.weight")
+                    for e in range(self.args.num_experts)
+                ]
+                up_ws = [
+                    weights.pop(f"{prefix}.experts.{e}.up_proj.weight")
+                    for e in range(self.args.num_experts)
+                ]
+                weights[f"{prefix}.switch_mlp.gate_up_proj.weight"] = mx.concatenate(
+                    [mx.stack(gate_ws), mx.stack(up_ws)], axis=1
+                )
+                down_ws = [
+                    weights.pop(f"{prefix}.experts.{e}.down_proj.weight")
+                    for e in range(self.args.num_experts)
+                ]
+                weights[f"{prefix}.switch_mlp.down_proj.weight"] = mx.stack(down_ws)
             return weights
+
+        # Handle legacy format with separate gate_proj/up_proj
         for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
-            for n in ["up_proj", "down_proj", "gate_proj"]:
-                if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
-                    to_join = [
-                        weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
-                        for e in range(self.args.num_experts)
-                    ]
-                    weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
+            fuse_gate_up_weights(weights, f"model.layers.{l}.mlp.switch_mlp")
         return weights
 
     @property
