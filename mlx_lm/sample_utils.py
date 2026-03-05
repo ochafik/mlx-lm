@@ -379,15 +379,34 @@ class GrammarLogitsProcessor:
         # Check if complete — force EOS so generation stops
         if self.grammar.is_complete():
             if self._eos_token_ids:
-                neg_inf = mx.full(logits.shape, float("-inf"), dtype=logits.dtype)
-                eos_mask = mx.zeros(logits.shape, dtype=mx.bool_)
+                vocab_size = logits.shape[-1]
+                indices = mx.arange(vocab_size)
+                eos_mask = mx.zeros((vocab_size,), dtype=mx.bool_)
                 for eos_id in self._eos_token_ids:
-                    eos_mask = eos_mask | (mx.arange(logits.shape[-1]) == eos_id)
+                    if eos_id < vocab_size:
+                        eos_mask = eos_mask | (indices == eos_id)
+                if logits.ndim > eos_mask.ndim:
+                    eos_mask = eos_mask.reshape((1,) * (logits.ndim - eos_mask.ndim) + eos_mask.shape)
+                neg_inf = mx.full(logits.shape, float("-inf"), dtype=logits.dtype)
                 return mx.where(eos_mask, logits, neg_inf)
             return logits
 
         # Get token mask from grammar
         mask = self.grammar.get_token_mask()
+
+        # Pad mask if vocab sizes differ (model vocab > tokenizer vocab)
+        vocab_size = logits.shape[-1]
+        if mask.shape[0] < vocab_size:
+            mask = mx.concatenate([
+                mask,
+                mx.zeros((vocab_size - mask.shape[0],), dtype=mask.dtype),
+            ])
+        elif mask.shape[0] > vocab_size:
+            mask = mask[:vocab_size]
+
+        # Match batch dimensions
+        if logits.ndim > mask.ndim:
+            mask = mask.reshape((1,) * (logits.ndim - mask.ndim) + mask.shape)
 
         # Check if any tokens are allowed
         if self._warn_on_empty and not self._warned:
