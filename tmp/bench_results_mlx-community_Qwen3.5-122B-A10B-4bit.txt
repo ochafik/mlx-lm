@@ -1,0 +1,73 @@
+============================================================
+  MoE Gate+Up Fusion Benchmark
+  Model: mlx-community/Qwen3.5-122B-A10B-4bit
+  Date:  Thu  5 Mar 2026 04:04:39 GMT
+  Host:  mac.lan / Mac14,5
+  MLX:   0.30.6
+============================================================
+
+>>> Step 1: Single MoE Block (interleaved A/B, 80 iterations)
+
+Loading mlx-community/Qwen3.5-122B-A10B-4bit...
+Fetching 24 files:   0%|          | 0/24 [00:00<?, ?it/s]Fetching 24 files:   4%|▍         | 1/24 [00:00<00:09,  2.44it/s]Fetching 24 files:  17%|█▋        | 4/24 [22:39<2:02:26, 367.35s/it]Fetching 24 files: 100%|██████████| 24/24 [22:39<00:00, 56.64s/it]  
+Loaded. hidden_size=3072
+Correctness: max diff = 0.00e+00
+
+=====================================================================================
+  Single MoE Block: fused (2 calls) vs unfused (3 calls)
+  Model: mlx-community/Qwen3.5-122B-A10B-4bit
+=====================================================================================
+ seq_len │      unfused        fused │  speedup │          IQR u/f
+─────────┼───────────────────────────┼──────────┼─────────────────
+       1 │      1.83 ms      1.77 ms │    +2.9% │ 0.13 / 0.16
+      64 │      9.24 ms      9.38 ms │    -1.6% │ 1.53 / 1.48
+     128 │     34.40 ms     29.14 ms │   +15.3% │ 1.56 / 1.38
+     256 │     40.25 ms     35.29 ms │   +12.3% │ 1.11 / 1.12
+     512 │     57.67 ms     52.66 ms │    +8.7% │ 1.15 / 1.11
+    1024 │     84.44 ms     80.07 ms │    +5.2% │ 1.15 / 1.76
+    2048 │    143.51 ms    139.02 ms │    +3.1% │ 1.90 / 1.53
+    4096 │    265.13 ms    263.28 ms │    +0.7% │ 10.13 / 10.45
+─────────────────────────────────────────────────────────────────────────────────────
+  Positive % = fused is faster. IQR = interquartile range (noise).
+
+
+>>> Step 2: Full model forward pass (fused, no patching)
+
+--- seq_len=256 ---
+Loading mlx-community/Qwen3.5-122B-A10B-4bit...
+Fetching 24 files:   0%|          | 0/24 [00:00<?, ?it/s]Fetching 24 files: 100%|██████████| 24/24 [00:00<00:00, 56871.92it/s]
+Mode: fused
+
+  Full model forward | fused | seq_len=256 | n=10
+  median=18396.2ms  p25=3034.1ms  p75=73659.9ms  IQR=70625.8ms  min=2973.8ms
+
+--- seq_len=512 ---
+Loading mlx-community/Qwen3.5-122B-A10B-4bit...
+Fetching 24 files:   0%|          | 0/24 [00:00<?, ?it/s]Fetching 24 files: 100%|██████████| 24/24 [00:00<00:00, 24769.51it/s]
+Mode: fused
+
+  Full model forward | fused | seq_len=512 | n=10
+  median=4708.1ms  p25=4650.0ms  p75=4802.6ms  IQR=152.6ms  min=4520.6ms
+
+--- seq_len=1024 ---
+Loading mlx-community/Qwen3.5-122B-A10B-4bit...
+Fetching 24 files:   0%|          | 0/24 [00:00<?, ?it/s]Fetching 24 files: 100%|██████████| 24/24 [00:00<00:00, 75629.82it/s]
+Mode: fused
+
+  Full model forward | fused | seq_len=1024 | n=10
+  median=6955.8ms  p25=6876.5ms  p75=7001.9ms  IQR=125.5ms  min=6864.2ms
+
+--- seq_len=2048 ---
+Loading mlx-community/Qwen3.5-122B-A10B-4bit...
+Fetching 24 files:   0%|          | 0/24 [00:00<?, ?it/s]Fetching 24 files: 100%|██████████| 24/24 [00:00<00:00, 127100.12it/s]
+Mode: fused
+
+  Full model forward | fused | seq_len=2048 | n=10
+  median=11665.0ms  p25=11611.0ms  p75=11713.8ms  IQR=102.8ms  min=11552.0ms
+
+>>> Step 3: Full model forward pass (unfused via git stash)
+
+--- seq_len=256 ---
+usage: bench_forward.py [-h] [--seq-len SEQ_LEN] [-n ITERATIONS] [-w WARMUP]
+                        [--json] [--seed SEED]
+bench_forward.py: error: unrecognized arguments: --model mlx-community/Qwen3.5-122B-A10B-4bit
