@@ -4,6 +4,11 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+# Use float32 for recurrent state to match Metal kernel's internal float32
+# computation. Without this, bfloat16 state causes batch vs sequential
+# processing divergence, breaking speculative decoding's batch verify.
+DEFAULT_STATE_DTYPE = mx.float32
+
 
 @partial(mx.compile, shapeless=True)
 def compute_g(A_log, a, dt_bias):
@@ -94,7 +99,7 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         }}
         for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
-          o_state[s_idx] = static_cast<InT>(state[i]);
+          o_state[s_idx] = state[i];
         }}
     """
     inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
@@ -180,6 +185,7 @@ def gated_delta_kernel(
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
+    state_type = state.dtype
     if g.ndim == 4:
         kernel = _gated_delta_kernel_vec
         inputs = [q, k, v, g, beta, state, T]
@@ -205,7 +211,7 @@ def gated_delta_kernel(
         grid=(32, Dv, B * Hv),
         threadgroup=(32, 4, 1),
         output_shapes=[(B, T, Hv, Dv), state.shape],
-        output_dtypes=[input_type, input_type],
+        output_dtypes=[input_type, state_type],
     )
 
 
@@ -217,6 +223,7 @@ def gated_delta_ops(
     beta: mx.array,
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
+    state_dtype: Optional[mx.Dtype] = None,
 ) -> Tuple[mx.array, mx.array]:
     """
     Ops-based reference implementation for prompt prefill (sequential loop).
@@ -235,7 +242,9 @@ def gated_delta_ops(
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
     if state is None:
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
+        if state_dtype is None:
+            state_dtype = DEFAULT_STATE_DTYPE if DEFAULT_STATE_DTYPE is not None else q.dtype
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=state_dtype)
 
     if (repeat_factor := Hv // Hk) > 1:
         q = mx.repeat(q, repeat_factor, -2)
@@ -268,6 +277,7 @@ def gated_delta_update(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
+    state_dtype: Optional[mx.Dtype] = None,
 ) -> Tuple[mx.array, mx.array]:
 
     beta = mx.sigmoid(b)
@@ -275,8 +285,16 @@ def gated_delta_update(
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
+        if state_dtype is None:
+            state_dtype = DEFAULT_STATE_DTYPE if DEFAULT_STATE_DTYPE is not None else q.dtype
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=state_dtype)
 
-    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+    # The Metal kernel's simd_sum differs from MLX's sum by ~1e-6 per step,
+    # but GatedDeltaNet's recurrent state amplifies this exponentially (up to
+    # 100+ after just 10 steps).  This breaks speculative decoding's batch
+    # verify, which must match sequential T=1 processing exactly.
+    # Use ops for T <= 32 (generation, verify, replay); kernel for prefill.
+    T = q.shape[1]
+    if not use_kernel or T <= 32 or mx.default_device() != mx.gpu or not mx.metal.is_available():
         return gated_delta_ops(q, k, v, g, beta, state, mask)
     return gated_delta_kernel(q, k, v, g, beta, state, mask)
