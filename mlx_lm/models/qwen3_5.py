@@ -303,15 +303,15 @@ class Qwen3_5TextModel(nn.Module):
 class MTPDecoderLayer(nn.Module):
     """Single full-attention decoder layer for MTP head (no GatedDeltaNet)."""
 
-    def __init__(self, args: TextModelArgs, mlp: Optional[nn.Module] = None):
+    def __init__(self, args: TextModelArgs):
         super().__init__()
         self.self_attn = Attention(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
-        if mlp is not None:
-            self.mlp = mlp
+        if args.num_experts > 0:
+            self.mlp = SparseMoeBlock(args)
         else:
             self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
@@ -330,12 +330,12 @@ class MTPHead(nn.Module):
     """Multi-Token Prediction head: projects (hidden_state, token_embedding)
     through a single full-attention decoder layer to predict the next token."""
 
-    def __init__(self, args: TextModelArgs, mlp: Optional[nn.Module] = None):
+    def __init__(self, args: TextModelArgs):
         super().__init__()
         self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.fc = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
-        self.layers = [MTPDecoderLayer(args, mlp=mlp)]
+        self.layers = [MTPDecoderLayer(args)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
