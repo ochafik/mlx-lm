@@ -35,6 +35,7 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         g_advance = "g_ += Hv;"
 
     source = f"""
+        #pragma clang fp contract(off)
         auto n = thread_position_in_grid.z;
         auto b_idx = n / Hv;
         auto hv_idx = n % Hv;
@@ -128,6 +129,138 @@ _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
 )
 
 
+def _make_gated_delta_kernel_intermediates(has_mask=False, vectorized=False):
+    """Kernel variant that outputs recurrent state at every timestep.
+
+    Extra output: state_all [B, T, Hv, Dv, Dk] — the recurrent state after
+    processing each token. Used to restore state on partial acceptance in
+    speculative decoding, eliminating the need for expensive replay.
+    """
+    if not mx.metal.is_available():
+        return None
+    mask_source = "mask[b_idx * T + t]" if has_mask else "true"
+
+    if vectorized:
+        g_comment = "// g: [B, T, Hv, Dk]"
+        g_setup = "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
+        g_access = "g_[s_idx]"
+        g_advance = "g_ += Hv * Dk;"
+    else:
+        g_comment = "// g: [B, T, Hv]"
+        g_setup = "auto g_ = g + b_idx * T * Hv;"
+        g_access = "g_[hv_idx]"
+        g_advance = "g_ += Hv;"
+
+    source = f"""
+        #pragma clang fp contract(off)
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        // q, k: [B, T, Hk, Dk]
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        // v, y: [B, T, Hv, Dv]
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // state_in, state_out: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        // state_all: [B, T, Hv, Dv, Dk]
+        s_all += (b_idx * T * Hv * Dv * Dk) + (hv_idx * Dv * Dk) + (dv_idx * Dk);
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {{
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }}
+
+        {g_comment}
+        {g_setup}
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {{
+          if ({mask_source}) {{
+            float kv_mem = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = state[i] * {g_access};
+              kv_mem += state[i] * k_[s_idx];
+            }}
+            kv_mem = simd_sum(kv_mem);
+
+            auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+            float out = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = state[i] + k_[s_idx] * delta;
+              out += state[i] * q_[s_idx];
+            }}
+            out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {{
+              y[dv_idx] = static_cast<InT>(out);
+            }}
+          }}
+          // Write intermediate state for this timestep
+          for (int i = 0; i < n_per_t; ++i) {{
+            auto s_idx = n_per_t * dk_idx + i;
+            s_all[s_idx] = state[i];
+          }}
+          // Increment data pointers to next time step
+          q_ += Hk * Dk;
+          k_ += Hk * Dk;
+          v_ += Hv * Dv;
+          y += Hv * Dv;
+          s_all += Hv * Dv * Dk;  // stride over [Hv, Dv, Dk] to next T
+          {g_advance}
+          beta_ += Hv;
+        }}
+        for (int i = 0; i < n_per_t; ++i) {{
+          auto s_idx = n_per_t * dk_idx + i;
+          o_state[s_idx] = state[i];
+        }}
+    """
+    inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
+    if has_mask:
+        inputs.append("mask")
+
+    suffix = "_intermediates"
+    if vectorized:
+        suffix += "_vec"
+    if has_mask:
+        suffix += "_mask"
+
+    return mx.fast.metal_kernel(
+        name=f"gated_delta_step{suffix}",
+        input_names=inputs,
+        output_names=["y", "state_out", "s_all"],
+        source=source,
+    )
+
+
+_gated_delta_kernel_intermediates = _make_gated_delta_kernel_intermediates(
+    has_mask=False, vectorized=False
+)
+_gated_delta_kernel_intermediates_masked = _make_gated_delta_kernel_intermediates(
+    has_mask=True, vectorized=False
+)
+_gated_delta_kernel_intermediates_vec = _make_gated_delta_kernel_intermediates(
+    has_mask=False, vectorized=True
+)
+_gated_delta_kernel_intermediates_vec_masked = _make_gated_delta_kernel_intermediates(
+    has_mask=True, vectorized=True
+)
+
+
 @mx.compile
 def _gated_delta_step_ops(
     q: mx.array,
@@ -215,6 +348,55 @@ def gated_delta_kernel(
     )
 
 
+def gated_delta_kernel_intermediates(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: mx.array,
+    mask: Optional[mx.array] = None,
+) -> Tuple[mx.array, mx.array, mx.array]:
+    """Like gated_delta_kernel but also returns state at every timestep.
+
+    Returns:
+        y: [B, T, Hv, Dv]
+        state_out: [B, Hv, Dv, Dk]
+        state_all: [B, T, Hv, Dv, Dk]
+    """
+    B, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    input_type = q.dtype
+    state_type = state.dtype
+    if g.ndim == 4:
+        kernel = _gated_delta_kernel_intermediates_vec
+        inputs = [q, k, v, g, beta, state, T]
+        if mask is not None:
+            kernel = _gated_delta_kernel_intermediates_vec_masked
+            inputs.append(mask)
+    else:
+        kernel = _gated_delta_kernel_intermediates
+        inputs = [q, k, v, g, beta, state, T]
+        if mask is not None:
+            kernel = _gated_delta_kernel_intermediates_masked
+            inputs.append(mask)
+
+    return kernel(
+        inputs=inputs,
+        template=[
+            ("InT", input_type),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+        ],
+        grid=(32, Dv, B * Hv),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(B, T, Hv, Dv), state.shape, (B, T, Hv, Dv, Dk)],
+        output_dtypes=[input_type, state_type, state_type],
+    )
+
+
 def gated_delta_ops(
     q: mx.array,
     k: mx.array,
@@ -289,12 +471,40 @@ def gated_delta_update(
             state_dtype = DEFAULT_STATE_DTYPE if DEFAULT_STATE_DTYPE is not None else q.dtype
         state = mx.zeros((B, Hv, Dv, Dk), dtype=state_dtype)
 
-    # The Metal kernel's simd_sum differs from MLX's sum by ~1e-6 per step,
-    # but GatedDeltaNet's recurrent state amplifies this exponentially (up to
-    # 100+ after just 10 steps).  This breaks speculative decoding's batch
-    # verify, which must match sequential T=1 processing exactly.
-    # Use ops for T <= 32 (generation, verify, replay); kernel for prefill.
+    # With #pragma clang fp contract(off) in the kernel, FMA contraction is
+    # disabled so the kernel produces bit-identical results to the ops path.
     T = q.shape[1]
-    if not use_kernel or T <= 32 or mx.default_device() != mx.gpu or not mx.metal.is_available():
+    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
         return gated_delta_ops(q, k, v, g, beta, state, mask)
     return gated_delta_kernel(q, k, v, g, beta, state, mask)
+
+
+def gated_delta_update_intermediates(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    state: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
+    state_dtype: Optional[mx.Dtype] = None,
+) -> Tuple[mx.array, mx.array, mx.array]:
+    """Like gated_delta_update but also returns intermediate states.
+
+    Returns:
+        y: [B, T, Hv, Dv]
+        state_final: [B, Hv, Dv, Dk]
+        state_all: [B, T, Hv, Dv, Dk] — recurrent state after each timestep
+    """
+    beta = mx.sigmoid(b)
+    g = compute_g(A_log, a, dt_bias)
+    if state is None:
+        B, _, Hk, Dk = q.shape
+        Hv, Dv = v.shape[-2:]
+        if state_dtype is None:
+            state_dtype = DEFAULT_STATE_DTYPE if DEFAULT_STATE_DTYPE is not None else q.dtype
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=state_dtype)
+
+    return gated_delta_kernel_intermediates(q, k, v, g, beta, state, mask)
