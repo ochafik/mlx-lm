@@ -14,7 +14,7 @@ from .base import (
     create_ssm_mask,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .gated_delta import gated_delta_update, gated_delta_update_intermediates
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
@@ -49,6 +49,10 @@ class TextModelArgs(BaseModelArgs):
     shared_expert_intermediate_size: int = 0
     moe_intermediate_size: int = 0
     norm_topk_prob: bool = True
+
+    # MTP (Multi-Token Prediction) fields
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
 
     # Rope parameters
     rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
@@ -134,6 +138,7 @@ class GatedDeltaNet(nn.Module):
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        output_intermediates: bool = False,
     ) -> mx.array:
         B, S, _ = inputs.shape
 
@@ -160,6 +165,11 @@ class GatedDeltaNet(nn.Module):
             cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
         conv_out = nn.silu(self.conv1d(conv_input))
 
+        # Save full conv_input when intermediates requested, for partial
+        # acceptance conv state reconstruction in speculative decoding.
+        if output_intermediates:
+            self._conv_input = conv_input
+
         q, k, v = [
             t.reshape(B, S, h, d)
             for t, h, d in zip(
@@ -170,22 +180,34 @@ class GatedDeltaNet(nn.Module):
         ]
 
         state = cache[1] if cache else None
+        # Initialize recurrent state in float32 for numerical stability.
+        if state is None:
+            state = mx.zeros(
+                (B, self.num_v_heads, self.head_v_dim, self.head_k_dim),
+                dtype=mx.float32,
+            )
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
+        if output_intermediates and not self.training:
+            out, state, state_all = gated_delta_update_intermediates(
+                q, k, v, a, b, self.A_log, self.dt_bias, state, mask,
+            )
+            self._state_intermediates = state_all
+        else:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
 
         if cache is not None:
             cache[1] = state
@@ -223,9 +245,13 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        output_intermediates: bool = False,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            r = self.linear_attn(
+                self.input_layernorm(x), mask, cache,
+                output_intermediates=output_intermediates,
+            )
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
@@ -243,12 +269,14 @@ class Qwen3_5TextModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
+        self._pre_norm_hidden = None
 
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        output_intermediates: bool = False,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -263,9 +291,69 @@ class Qwen3_5TextModel(nn.Module):
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states = layer(
+                hidden_states, mask=mask, cache=c,
+                output_intermediates=output_intermediates,
+            )
 
+        self._pre_norm_hidden = hidden_states
         return self.norm(hidden_states)
+
+
+class MTPDecoderLayer(nn.Module):
+    """Single full-attention decoder layer for MTP head (no GatedDeltaNet)."""
+
+    def __init__(self, args: TextModelArgs, mlp: Optional[nn.Module] = None):
+        super().__init__()
+        self.self_attn = Attention(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        if mlp is not None:
+            self.mlp = mlp
+        else:
+            self.mlp = MLP(args.hidden_size, args.intermediate_size)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        return h + self.mlp(self.post_attention_layernorm(h))
+
+
+class MTPHead(nn.Module):
+    """Multi-Token Prediction head: projects (hidden_state, token_embedding)
+    through a single full-attention decoder layer to predict the next token."""
+
+    def __init__(self, args: TextModelArgs, mlp: Optional[nn.Module] = None):
+        super().__init__()
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fc = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
+        self.layers = [MTPDecoderLayer(args, mlp=mlp)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        hidden_state: mx.array,
+        token_embedding: mx.array,
+        mask: Optional[mx.array] = None,
+        cache=None,
+    ) -> mx.array:
+        h_norm = self.pre_fc_norm_hidden(hidden_state)
+        e_norm = self.pre_fc_norm_embedding(token_embedding)
+        h = self.fc(mx.concatenate([e_norm, h_norm], axis=-1))
+        for layer, c in zip(self.layers, cache or [None]):
+            h = layer(h, mask=mask, cache=c)
+        return h  # pre-norm hidden for chaining
+
+    def make_cache(self):
+        return [KVCache()]
 
 
 class TextModel(nn.Module):
@@ -274,21 +362,47 @@ class TextModel(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = Qwen3_5TextModel(args)
+        self._last_hidden_state = None
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+        if getattr(args, "mtp_num_hidden_layers", 0) > 0:
+            self.mtp = MTPHead(args)
+        else:
+            self.mtp = None
 
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        output_intermediates: bool = False,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
+        out = self.model(
+            inputs, cache, input_embeddings=input_embeddings,
+            output_intermediates=output_intermediates,
+        )
+        self._last_hidden_state = self.model._pre_norm_hidden
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
         return out
+
+    def mtp_draft(self, hidden_state, token_ids, mtp_cache):
+        """Run one MTP draft step: predict next token from hidden state + token embedding."""
+        token_emb = self.model.embed_tokens(token_ids)
+        mtp_hidden = self.mtp(hidden_state, token_emb, cache=mtp_cache)
+        normed = self.mtp.norm(mtp_hidden)
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(normed)
+        else:
+            logits = self.lm_head(normed)
+        return mtp_hidden, logits
+
+    @property
+    def has_mtp(self):
+        return self.mtp is not None
 
     @property
     def layers(self):
@@ -298,12 +412,11 @@ class TextModel(nn.Module):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
-        has_mtp_weights = any("mtp." in k for k in weights)
+        # Detect raw HF format: unsanitized conv1d weights have shape [out, in, kernel]
+        # instead of MLX's [out, kernel, in]. This also implies norms need +1.0 shift.
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -314,11 +427,14 @@ class TextModel(nn.Module):
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            ".pre_fc_norm_embedding.weight",
+            ".pre_fc_norm_hidden.weight",
+            "mtp.norm.weight",
         )
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
+            if has_unsanitized_conv1d and any(k.endswith(sfx) for sfx in norm_keys):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
         return weights
