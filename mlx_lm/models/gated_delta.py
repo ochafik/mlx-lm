@@ -4,10 +4,11 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-# Use float32 for recurrent state to match Metal kernel's internal float32
-# computation. Without this, bfloat16 state causes batch vs sequential
-# processing divergence, breaking speculative decoding's batch verify.
-DEFAULT_STATE_DTYPE = mx.float32
+# Default recurrent state dtype. None means use the input dtype (q.dtype).
+# Callers can override by passing state_dtype= or by passing a pre-initialized
+# state. Set to mx.float32 to match Metal kernel's internal float32 computation
+# (needed for speculative decoding where batch vs sequential must match exactly).
+DEFAULT_STATE_DTYPE = None
 
 
 @partial(mx.compile, shapeless=True)
