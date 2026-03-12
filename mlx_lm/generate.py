@@ -752,28 +752,30 @@ def mtp_speculative_generate_step(
     # Check if model has non-trimmable caches (hybrid GDN + attention)
     _has_non_trimmable = not all(c.is_trimmable() for c in verify_cache)
 
-    # Check if intermediates are available for instant state restore
-    _supports_intermediates = _has_non_trimmable and any(
-        hasattr(l, "linear_attn")
-        for l in getattr(text_model.model, "layers", [])
-    )
+    # Pre-classify layers: list of (cache, "trim") or (cache, "gdn", gdn_module)
+    _layer_cache_map = []
+    _supports_intermediates = False
+    for c, layer in zip(verify_cache, getattr(text_model.model, "layers", [])):
+        if c.is_trimmable():
+            _layer_cache_map.append((c, "trim", None))
+        elif hasattr(layer, "linear_attn"):
+            _layer_cache_map.append((c, "gdn", layer.linear_attn))
+            _supports_intermediates = True
+        else:
+            _layer_cache_map.append((c, "other", None))
 
-    def _restore_from_intermediates(cache_list, n_accepted, num_draft):
+    def _restore_from_intermediates(n_accepted, num_draft):
         """Restore GDN cache states from kernel intermediates at position n."""
-        layers = text_model.model.layers
-        for c, layer in zip(cache_list, layers):
-            if c.is_trimmable():
-                n_trim = (num_draft + 1) - (n_accepted + 1)
+        n_trim = num_draft - n_accepted
+        for c, kind, gdn in _layer_cache_map:
+            if kind == "trim":
                 if n_trim > 0:
                     c.trim(n_trim)
-            elif hasattr(layer, "linear_attn"):
-                gdn = layer.linear_attn
-                if hasattr(gdn, "_state_intermediates"):
-                    c[1] = gdn._state_intermediates[:, n_accepted]
-                if hasattr(gdn, "_conv_input"):
-                    end = (gdn.conv_kernel_size - 1) + n_accepted + 1
-                    start = end - (gdn.conv_kernel_size - 1)
-                    c[0] = gdn._conv_input[:, start:end]
+            elif kind == "gdn":
+                c[1] = gdn._state_intermediates[:, n_accepted]
+                end = (gdn.conv_kernel_size - 1) + n_accepted + 1
+                start = end - (gdn.conv_kernel_size - 1)
+                c[0] = gdn._conv_input[:, start:end]
 
     def _save_cache_state(cache_list):
         saved = {}
@@ -919,7 +921,7 @@ def mtp_speculative_generate_step(
 
                     if _supports_intermediates:
                         if n < num_draft:
-                            _restore_from_intermediates(verify_cache, n, num_draft)
+                            _restore_from_intermediates(n, num_draft)
                     elif _has_non_trimmable:
                         if n < num_draft:
                             _restore_cache_state(verify_cache, _verify_saved)
@@ -960,7 +962,7 @@ def mtp_speculative_generate_step(
     finally:
         if num_draft > 0:
             if _supports_intermediates:
-                _restore_from_intermediates(verify_cache, n, num_draft)
+                _restore_from_intermediates(n, num_draft)
             elif _has_non_trimmable:
                 _restore_cache_state(verify_cache, _verify_saved)
                 for c in verify_cache:
