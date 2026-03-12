@@ -852,9 +852,17 @@ def mtp_speculative_generate_step(
     num_draft = 0
     n = 0
 
+    # Adaptive draft: disable drafting when acceptance is consistently 0,
+    # periodically re-probe to check if drafting becomes profitable again.
+    _accept_history = 0
+    _draft_cycle_count = 0
+    _baseline_count = 0
+    _probe_interval = 32
+    _adaptive_draft = num_draft_tokens
+
     try:
         while True:
-            num_draft = min(max_tokens - ntoks, num_draft_tokens)
+            num_draft = min(max_tokens - ntoks, _adaptive_draft)
 
             if num_draft > 0 and _has_non_trimmable and not _supports_intermediates:
                 _verify_saved = _save_cache_state(verify_cache)
@@ -926,6 +934,26 @@ def mtp_speculative_generate_step(
                         n_trim = num_draft - n
                         if n_trim > 0:
                             cache.trim_prompt_cache(verify_cache, n_trim)
+
+            # Adaptive draft: track acceptance and disable/re-enable drafting
+            if num_draft > 0:
+                _accept_history = (
+                    (_accept_history << 1) | (1 if n > 0 else 0)
+                ) & 0xFF
+                _draft_cycle_count = min(_draft_cycle_count + 1, 8)
+                if _draft_cycle_count >= 2 and _accept_history == 0:
+                    _adaptive_draft = 0
+                    _baseline_count = 0
+                elif n > 0:
+                    _probe_interval = 32
+            else:
+                _baseline_count += 1
+                if _baseline_count >= _probe_interval:
+                    _adaptive_draft = 1
+                    _draft_cycle_count = 0
+                    _accept_history = 0
+                    _baseline_count = 0
+                    _probe_interval = min(_probe_interval * 2, 256)
 
             if ntoks == max_tokens:
                 break
